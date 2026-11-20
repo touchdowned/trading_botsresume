@@ -46,8 +46,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === CONFIGURATION ===
-DATABENTO_API_KEY = os.environ.get('DATABENTO_API_KEY', 'db-YPHjrPE6UB5wyt4RptKWjCAuWUSew')
-GOOGLE_DRIVE_FOLDER_ID = "1gbGZiHeFEbHoY8Cu9JBdmobxkMbhMSfY"
+DATABENTO_API_KEY = os.environ.get('DATABENTO_API_KEY', 'Nuh uh)
+GOOGLE_DRIVE_FOLDER_ID = "Nuh uh"
 GOOGLE_SCOPES = ['https://www.googleapis.com/auth/drive']
 
 # POSITION SIZE CONFIGURATION
