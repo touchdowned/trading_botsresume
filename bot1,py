@@ -1,0 +1,2542 @@
+"""
+Comprehensive Historical ML Trading Simulation System
+FIXED VERSION: No look-ahead bias - trades exit chronologically
+Optimized version with vectorized tick processing for 74M+ tick datasets
+WITH DAILY AND MONTHLY PNL REPORTING
+FIXED: Realistic entry timing - signals detected at bar close, entries on next bar open
+ENHANCED: ML vs Original Strategy Performance Comparison
+FIXED: Force close all trades at NY session end (4:30 PM ET) to prevent overnight gap issues
+MODIFIED: 35 contracts per trade with enhanced daily profitability metrics
+"""
+import cProfile
+import os
+import json
+import pickle
+import time
+import logging
+import databento as db
+import numpy as np
+import pandas as pd
+import pandas_ta as ta
+from datetime import datetime, timedelta
+from collections import deque, defaultdict
+from typing import Dict, List, Tuple, Optional, Any
+import warnings
+import uuid
+
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+# Google Drive imports
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
+import io
+
+warnings.filterwarnings('ignore')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# === CONFIGURATION ===
+DATABENTO_API_KEY = os.environ.get('DATABENTO_API_KEY', 'db-YPHjrPE6UB5wyt4RptKWjCAuWUSew')
+GOOGLE_DRIVE_FOLDER_ID = "1gbGZiHeFEbHoY8Cu9JBdmobxkMbhMSfY"
+GOOGLE_SCOPES = ['https://www.googleapis.com/auth/drive']
+
+# POSITION SIZE CONFIGURATION
+CONTRACTS_PER_TRADE = 35  # Number of contracts per trade
+POINTS_VALUE = 20  # Dollar value per point for NQ futures
+
+# ML Configuration
+ML_CONFIG = {
+    'min_trades_to_start_learning': 300,
+    'retrain_every_n_trades': 300,
+    'lookback_trades': 15000,
+    'confidence_threshold': 0.65,
+    'session_lookback_bars': 1380,  # 23 hours
+    'daily_lookback_bars': 1440,     # 24 hours
+    'weekly_lookback_bars': 7200,    # ~5 trading days
+    'buffer_calendar_days': 12,      # Calendar days needed for 7200 bars
+    'max_trade_duration_bars': 240,  # 4 hours max trade duration
+}
+
+# TP/SL Grid Configuration
+TP_SL_GRID = {
+    'tp_values': [4, 6, 8, 10, 12, 15],
+    'sl_values': [2, 3, 4, 5, 6, 8]
+}
+
+# Time Segments
+TIME_SEGMENTS = {
+    'pre_market': {
+        'name': 'Pre-Market',
+        'hours': [6, 7, 8],
+        'default_tp': {'none': 8, 'medium': 7, 'high': 6, 'extreme': 5},
+        'default_sl': {'none': 4, 'medium': 4, 'high': 5, 'extreme': 6},
+    },
+    'morning': {
+        'name': 'Morning',
+        'hours': [9, 10],
+        'default_tp': {'none': 12, 'medium': 10, 'high': 8, 'extreme': 6},
+        'default_sl': {'none': 6, 'medium': 6, 'high': 7, 'extreme': 8},
+    },
+    'midday': {
+        'name': 'Midday',
+        'hours': [11, 12, 13],
+        'default_tp': {'none': 10, 'medium': 9, 'high': 8, 'extreme': 6},
+        'default_sl': {'none': 5, 'medium': 5, 'high': 6, 'extreme': 7},
+    },
+    'afternoon': {
+        'name': 'Afternoon',
+        'hours': [14, 15],
+        'default_tp': {'none': 12, 'medium': 10, 'high': 8, 'extreme': 6},
+        'default_sl': {'none': 6, 'medium': 6, 'high': 7, 'extreme': 8},
+    },
+    'close': {
+        'name': 'Market Close',
+        'hours': [16],
+        'default_tp': {'none': 10, 'medium': 8, 'high': 6, 'extreme': 5},
+        'default_sl': {'none': 5, 'medium': 5, 'high': 6, 'extreme': 7},
+    },
+    'after_hours': {
+        'name': 'After Hours',
+        'hours': [17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5],
+        'default_tp': {'none': 8, 'medium': 7, 'high': 6, 'extreme': 5},
+        'default_sl': {'none': 4, 'medium': 4, 'high': 5, 'extreme': 6},
+    }
+}
+
+# News Impact Levels - now with functional multipliers
+NEWS_IMPACT_LEVELS = {
+    'none': {'name': 'No News', 'tp_multiplier': 1.0, 'sl_multiplier': 1.0},
+    'medium': {'name': 'Medium Impact', 'tp_multiplier': 0.9, 'sl_multiplier': 1.1},
+    'high': {'name': 'High Impact', 'tp_multiplier': 0.8, 'sl_multiplier': 1.2},
+    'extreme': {'name': 'Extreme Impact', 'tp_multiplier': 0.7, 'sl_multiplier': 1.3}
+}
+
+# Extended Economic Calendar (2023-2025)
+ECONOMIC_CALENDAR_EXTENDED = {
+    '2023': {
+        'FOMC': [
+            {'date': '2023-01-31', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2023-03-22', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2023-05-03', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2023-06-14', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2023-07-26', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2023-09-20', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2023-11-01', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2023-12-13', 'time': '14:00', 'impact': 'extreme'},
+        ],
+        'NFP': [
+            {'date': '2023-01-06', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-02-03', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-03-10', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-04-07', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-05-05', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-06-02', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-07-07', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-08-04', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-09-01', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-10-06', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-11-03', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-12-08', 'time': '08:30', 'impact': 'high'},
+        ],
+        'CPI': [
+            {'date': '2023-01-12', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-02-14', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-03-14', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-04-12', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-05-10', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-06-13', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-07-12', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-08-10', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-09-13', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-10-12', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-11-14', 'time': '08:30', 'impact': 'high'},
+            {'date': '2023-12-12', 'time': '08:30', 'impact': 'high'},
+        ],
+    },
+    '2024': {
+        'FOMC': [
+            {'date': '2024-01-31', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2024-03-20', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2024-05-01', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2024-06-12', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2024-07-31', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2024-09-18', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2024-11-07', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2024-12-18', 'time': '14:00', 'impact': 'extreme'},
+        ],
+        'NFP': [
+            {'date': '2024-01-05', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-02-02', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-03-08', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-04-05', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-05-03', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-06-07', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-07-05', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-08-02', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-09-06', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-10-04', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-11-01', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-12-06', 'time': '08:30', 'impact': 'high'},
+        ],
+        'CPI': [
+            {'date': '2024-01-11', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-02-13', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-03-12', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-04-10', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-05-15', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-06-12', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-07-11', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-08-14', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-09-11', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-10-10', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-11-13', 'time': '08:30', 'impact': 'high'},
+            {'date': '2024-12-11', 'time': '08:30', 'impact': 'high'},
+        ],
+    },
+    '2025': {
+        'FOMC': [
+            {'date': '2025-01-29', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2025-03-19', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2025-05-07', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2025-06-18', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2025-07-30', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2025-09-17', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2025-11-05', 'time': '14:00', 'impact': 'extreme'},
+            {'date': '2025-12-17', 'time': '14:00', 'impact': 'extreme'},
+        ],
+        'NFP': [
+            {'date': '2025-01-10', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-02-07', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-03-07', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-04-04', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-05-02', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-06-06', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-07-03', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-08-01', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-09-05', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-10-03', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-11-07', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-12-05', 'time': '08:30', 'impact': 'high'},
+        ],
+        'CPI': [
+            {'date': '2025-01-15', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-02-13', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-03-12', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-04-10', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-05-14', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-06-11', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-07-15', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-08-12', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-09-11', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-10-15', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-11-13', 'time': '08:30', 'impact': 'high'},
+            {'date': '2025-12-11', 'time': '08:30', 'impact': 'high'},
+        ],
+    }
+}
+
+
+# === HELPER FUNCTIONS ===
+def get_economic_events_for_date(date):
+    """Get all economic events for a specific date"""
+    date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+    year = date_str[:4]
+
+    events = []
+    if year in ECONOMIC_CALENDAR_EXTENDED:
+        for event_type, event_list in ECONOMIC_CALENDAR_EXTENDED[year].items():
+            for event in event_list:
+                if event['date'] == date_str:
+                    event_copy = event.copy()
+                    event_copy['type'] = event_type
+                    events.append(event_copy)
+
+    return events
+
+
+def get_current_time_segment(timestamp=None):
+    """Get the time segment for a given timestamp"""
+    if timestamp is None:
+        timestamp = datetime.now()
+
+    hour = timestamp.hour
+    for segment_id, segment in TIME_SEGMENTS.items():
+        if hour in segment['hours']:
+            return segment_id, segment
+    return 'after_hours', TIME_SEGMENTS['after_hours']
+
+
+def get_news_impact_for_date(date):
+    """Get the highest news impact level for a specific date"""
+    events = get_economic_events_for_date(date)
+
+    if not events:
+        return 'none'
+
+    has_extreme = any(e['impact'] == 'extreme' for e in events)
+    has_high = any(e['impact'] == 'high' for e in events)
+    has_medium = any(e['impact'] == 'medium' for e in events)
+
+    if has_extreme:
+        return 'extreme'
+    elif has_high:
+        return 'high'
+    elif has_medium:
+        return 'medium'
+    else:
+        return 'none'
+
+
+def is_ny_session(timestamp):
+    """Check if timestamp is during NY session (6:00 AM - 4:30 PM ET)"""
+    hour = timestamp.hour
+    minute = timestamp.minute
+
+    # Convert to minutes from midnight
+    time_minutes = hour * 60 + minute
+
+    # NY session: 6:00 AM (360) to 4:30 PM (990)
+    return 360 <= time_minutes < 990
+
+
+def is_ny_session_end(timestamp):
+    """Check if timestamp is at NY session end (4:30 PM ET)"""
+    hour = timestamp.hour
+    minute = timestamp.minute
+
+    # Check if it's 4:30 PM (16:30)
+    return hour == 16 and minute == 30
+
+
+def calculate_technical_indicators(df):
+    """Calculate technical indicators for a DataFrame"""
+    try:
+        df = df.copy()
+
+        # RSI
+        if len(df) >= 15:
+            df['RSI'] = ta.rsi(df['Close'], length=14)
+            df['RSI_5'] = ta.rsi(df['Close'], length=5)
+        else:
+            df['RSI'] = 50
+            df['RSI_5'] = 50
+
+        # Moving averages
+        if len(df) >= 20:
+            df['SMA_20'] = ta.sma(df['Close'], length=20)
+            df['EMA_20'] = ta.ema(df['Close'], length=20)
+        else:
+            df['SMA_20'] = df['Close'].mean()
+            df['EMA_20'] = df['Close'].mean()
+
+        if len(df) >= 10:
+            df['EMA_10'] = ta.ema(df['Close'], length=10)
+        else:
+            df['EMA_10'] = df['Close'].mean()
+
+        # MACD
+        if len(df) >= 26:
+            macd = ta.macd(df['Close'])
+            if macd is not None:
+                df['MACD'] = macd.iloc[:, 0]
+                df['MACD_signal'] = macd.iloc[:, 2]
+                df['MACD_hist'] = macd.iloc[:, 1]
+        else:
+            df['MACD'] = 0
+            df['MACD_signal'] = 0
+            df['MACD_hist'] = 0
+
+        # Bollinger Bands
+        if len(df) >= 20:
+            bbands = ta.bbands(df['Close'])
+            if bbands is not None:
+                df['BB_upper'] = bbands.iloc[:, 0]
+                df['BB_middle'] = bbands.iloc[:, 1]
+                df['BB_lower'] = bbands.iloc[:, 2]
+                df['BB_width'] = df['BB_upper'] - df['BB_lower']
+                df['BB_position'] = (df['Close'] - df['BB_lower']) / (df['BB_width'] + 0.0001)
+        else:
+            df['BB_position'] = 0.5
+
+        # ATR
+        if len(df) >= 15:
+            df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        else:
+            df['ATR'] = (df['High'] - df['Low']).mean()
+
+        # Volume
+        if len(df) >= 20:
+            df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
+        else:
+            df['Volume_SMA'] = df['Volume'].mean()
+        df['Volume_Ratio'] = df['Volume'] / (df['Volume_SMA'] + 1)
+
+        df.ffill(inplace=True)
+        df.fillna(0, inplace=True)
+
+        return df
+
+    except Exception as e:
+        logger.error(f"Error calculating indicators: {e}")
+        return df
+
+
+# === OPTIMIZED TICK PROCESSOR ===
+class OptimizedTickProcessor:
+    """Tick processor for price retrieval - no longer used for exit detection to avoid look-ahead"""
+
+    def __init__(self, trades_df):
+        """Initialize with pre-computed numpy arrays for fastest access"""
+        logger.info(f"Initializing tick processor for {len(trades_df):,} ticks...")
+        self.trades_df = trades_df
+
+        # Convert to numpy arrays for maximum speed
+        self.tick_times = trades_df.index.values
+        self.tick_prices = trades_df['price'].values
+
+        # Pre-compute time bounds for binary search optimization
+        self.min_time = self.tick_times[0]
+        self.max_time = self.tick_times[-1]
+
+        logger.info("✅ Tick processor initialized")
+
+    def get_tick_prices_for_bar(self, bar_timestamp):
+        """Get all tick prices within a specific 1-minute bar (no look-ahead)"""
+        bar_start = pd.Timestamp(bar_timestamp).to_datetime64()
+        bar_end = pd.Timestamp(bar_timestamp + pd.Timedelta(minutes=1)).to_datetime64()
+
+        # Get indices for this bar only
+        start_idx = np.searchsorted(self.tick_times, bar_start, side='left')
+        end_idx = np.searchsorted(self.tick_times, bar_end, side='left')
+
+        if start_idx < end_idx:
+            return self.tick_prices[start_idx:end_idx], self.tick_times[start_idx:end_idx]
+        return np.array([]), np.array([])
+
+
+# === DATA INFRASTRUCTURE ===
+def load_aligned_historical_data(start_date, end_date, symbol='NQ'):
+    """Load trades and generate OHLCV from tick data with proper UTC to ET conversion"""
+    import databento as db
+    import glob
+    from pathlib import Path
+    import pytz
+
+    TRADES_DIR = r'C:\Users\This0\Downloads\NQ_Tick_Data_1Year_Test\GLBX-20260127-XHQG48BG4J"'
+
+    logger.info(f"Loading historical data from DBN files:")
+    logger.info(f"  Trades directory: {TRADES_DIR}")
+    logger.info(f"  Simulation period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+
+    # === LOAD TRADES DATA ===
+    trades_files = glob.glob(f'{TRADES_DIR}/*.trades.dbn*')
+    trades_files.sort()
+
+    # Check actual date range available
+    available_dates = []
+    for file in trades_files:
+        try:
+            filename = Path(file).name
+            date_str = filename.split('-')[2].split('.')[0]
+            file_date = datetime.strptime(date_str, '%Y%m%d')
+            available_dates.append(file_date)
+        except:
+            pass
+
+    if available_dates:
+        logger.info(
+            f"Available data range: {min(available_dates).strftime('%Y-%m-%d')} to {max(available_dates).strftime('%Y-%m-%d')}")
+
+    all_trades = []
+
+    for file_path in trades_files:
+        try:
+            filename = Path(file_path).name
+            date_str = filename.split('-')[2].split('.')[0]
+            file_date = datetime.strptime(date_str, '%Y%m%d')
+
+            # Skip files outside date range
+            if file_date < start_date or file_date > end_date:
+                continue
+
+            logger.info(f"Loading trades from: {filename}")
+
+            store = db.DBNStore.from_file(file_path)
+            df = store.to_df(map_symbols=False)
+
+            if 'ts_event' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['ts_event'], unit='ns')
+            else:
+                df['timestamp'] = pd.to_datetime(df.index, unit='ns')
+
+            # PRICE FILTER: Remove clearly bad prices
+            # NQ futures should be between 5000 and 25000 (reasonable range)
+            price_mask = (df['price'] >= 5000) & (df['price'] <= 30000)
+            bad_price_count = (~price_mask).sum()
+            if bad_price_count > 0:
+                logger.warning(f"  Filtered {bad_price_count} trades with unreasonable prices")
+                df = df[price_mask]
+
+            trades_data = pd.DataFrame({
+                'timestamp': df['timestamp'],
+                'price': df['price'],  # Already scaled correctly
+                'size': df['size'] if 'size' in df.columns else 1,
+                'symbol': 'NQ1!'
+            })
+
+            trades_data.set_index('timestamp', inplace=True)
+            all_trades.append(trades_data)
+
+        except Exception as e:
+            logger.warning(f"Error loading {file_path}: {e}")
+            continue
+
+    if all_trades:
+        trades_df = pd.concat(all_trades)
+        trades_df.sort_index(inplace=True)
+        trades_df = trades_df[~trades_df.index.duplicated(keep='first')]
+
+        # CRITICAL TIMEZONE CONVERSION - UTC to ET
+        if trades_df.index.tz is not None:
+            # If already timezone-aware, convert to ET
+            trades_df.index = trades_df.index.tz_convert('America/New_York')
+            logger.info("✅ Converted timezone-aware UTC timestamps to ET")
+        else:
+            # If timezone-naive, assume UTC and convert to ET
+            trades_df.index = pd.to_datetime(trades_df.index).tz_localize('UTC').tz_convert('America/New_York')
+            logger.info("✅ Localized UTC timestamps and converted to ET")
+
+        # Now make timezone-naive for consistency with rest of code
+        trades_df.index = trades_df.index.tz_localize(None)
+
+        logger.info(f"✅ Loaded {len(trades_df):,} total trade records for NQ1!")
+        logger.info(f"  Price range: ${trades_df['price'].min():.2f} to ${trades_df['price'].max():.2f}")
+        logger.info(f"  Time range (ET): {trades_df.index.min()} to {trades_df.index.max()}")
+    else:
+        trades_df = pd.DataFrame()
+        logger.warning("⚠️ No trades data loaded")
+        return trades_df, pd.DataFrame()
+
+    # === GENERATE OHLCV FROM TICK DATA ===
+    logger.info("Generating OHLCV bars from tick data (timestamps now in ET)...")
+
+    # Add buffer for indicators
+    buffer_days = ML_CONFIG['buffer_calendar_days']
+    adjusted_start = start_date - timedelta(days=buffer_days)
+
+    # Filter trades to include buffer period (now comparing ET times)
+    trades_for_ohlcv = trades_df[(trades_df.index >= adjusted_start) &
+                                 (trades_df.index <= end_date)]
+
+    # Generate OHLCV bars (now from ET timestamps)
+    ohlcv_df = trades_for_ohlcv['price'].resample('1min').ohlc()
+    ohlcv_df.columns = ['Open', 'High', 'Low', 'Close']
+    ohlcv_df['Volume'] = trades_for_ohlcv['size'].resample('1min').sum()
+
+    # Forward fill gaps
+    ohlcv_df = ohlcv_df.fillna(method='ffill')
+    ohlcv_df = ohlcv_df.fillna(method='bfill')
+
+    # Add symbol column
+    ohlcv_df['symbol'] = 'NQ1!'
+
+    # Remove any remaining NaN rows
+    ohlcv_df = ohlcv_df.dropna()
+
+    logger.info(f"✅ Generated {len(ohlcv_df)} OHLCV bars from tick data")
+    logger.info(f"  Date range (ET): {ohlcv_df.index.min()} to {ohlcv_df.index.max()}")
+    logger.info(f"  Price range: ${ohlcv_df['Low'].min():.2f} to ${ohlcv_df['High'].max():.2f}")
+
+    # Verify we're actually trading in the right hours now
+    sample_times = ohlcv_df.index[::1000][:10]  # Sample 10 timestamps
+    logger.info("Sample timestamps to verify ET conversion:")
+    for ts in sample_times:
+        logger.info(f"  {ts} (hour={ts.hour}) - NY Session: {is_ny_session(ts)}")
+
+    return trades_df, ohlcv_df
+
+# === PINESCRIPT STRATEGY ===
+class PineScriptStrategy:
+    """Python implementation of contrarian NY session strategy"""
+
+    def __init__(self):
+        self.ma_fast_len = 9
+        self.ma_slow_len = 21
+        self.rsi_len = 14
+        self.min_signals = 3
+
+    def calculate_signals(self, df):
+        """Calculate contrarian signals based on PineScript logic"""
+        # Check minimum data requirements
+        if len(df) < max(self.ma_slow_len, self.rsi_len, 26):  # Need 26 for MACD
+            return None
+
+        # Work on a copy to avoid side effects
+        df = df.copy()
+
+        # Remove duplicates if present
+        if df.index.duplicated().any():
+            df = df[~df.index.duplicated(keep='last')]
+
+        # Technical indicators
+        try:
+            df['MA_fast'] = df['Close'].rolling(self.ma_fast_len).mean()
+            df['MA_slow'] = df['Close'].rolling(self.ma_slow_len).mean()
+            df['RSI'] = ta.rsi(df['Close'], self.rsi_len)
+
+            # MACD with error handling
+            macd = ta.macd(df['Close'], 12, 26, 9)
+            if macd is not None and not macd.empty:
+                df['MACD_line'] = macd.iloc[:, 0]
+                df['MACD_signal'] = macd.iloc[:, 2]
+            else:
+                df['MACD_line'] = 0
+                df['MACD_signal'] = 0
+
+            # Bollinger Bands with error handling
+            bb = ta.bbands(df['Close'], 20, 2)
+            if bb is not None and not bb.empty:
+                df['BB_upper'] = bb.iloc[:, 0]
+                df['BB_middle'] = bb.iloc[:, 1]
+                df['BB_lower'] = bb.iloc[:, 2]
+            else:
+                # Set defaults if BB fails
+                df['BB_upper'] = df['Close'] * 1.02
+                df['BB_middle'] = df['Close']
+                df['BB_lower'] = df['Close'] * 0.98
+
+        except Exception as e:
+            logger.warning(f"Indicator calculation failed: {e}")
+            return None
+
+        # Check we have enough data for comparisons
+        if len(df) < 3:
+            return None
+
+        # Count bullish/bearish signals
+        signal_count_bullish = 0
+        signal_count_bearish = 0
+
+        latest = df.iloc[-1]
+        prev1 = df.iloc[-2]
+        prev2 = df.iloc[-3]
+
+        # Signal 1: MA Trend
+        if latest['Close'] > latest['MA_fast'] > latest['MA_slow']:
+            signal_count_bullish += 1
+        elif latest['Close'] < latest['MA_fast'] < latest['MA_slow']:
+            signal_count_bearish += 1
+
+        # Signal 2: RSI Momentum (with safe access)
+        if latest['RSI'] is not None and prev1['RSI'] is not None:
+            if 50 < latest['RSI'] < 70 and latest['RSI'] > prev1['RSI']:
+                signal_count_bullish += 1
+            elif 30 < latest['RSI'] < 50 and latest['RSI'] < prev1['RSI']:
+                signal_count_bearish += 1
+
+        # Signal 3: MACD Momentum
+        if latest['MACD_line'] != 0 and latest['MACD_signal'] != 0:  # Check if MACD calculated
+            if latest['MACD_line'] > latest['MACD_signal'] and latest['MACD_line'] > prev1['MACD_line']:
+                signal_count_bullish += 1
+            elif latest['MACD_line'] < latest['MACD_signal'] and latest['MACD_line'] < prev1['MACD_line']:
+                signal_count_bearish += 1
+
+        # Signal 4: Price vs Bollinger Bands (all columns checked)
+        if all(col in df.columns for col in ['BB_upper', 'BB_middle', 'BB_lower']):
+            if latest['BB_middle'] < latest['Close'] < latest['BB_upper']:
+                signal_count_bullish += 1
+            elif latest['BB_lower'] < latest['Close'] < latest['BB_middle']:
+                signal_count_bearish += 1
+
+        # Signal 5: Candle Patterns
+        is_green = latest['Close'] > latest['Open']
+        is_red = latest['Close'] < latest['Open']
+        prev_is_green = prev1['Close'] > prev1['Open']
+        prev_is_red = prev1['Close'] < prev1['Open']
+
+        # Bullish engulfing
+        if is_green and prev_is_red and latest['Close'] > prev1['Open']:
+            signal_count_bullish += 1
+        # Bearish engulfing
+        elif is_red and prev_is_green and latest['Close'] < prev1['Open']:
+            signal_count_bearish += 1
+
+        # Signal 6: Price Action Momentum
+        consecutive_up = latest['Close'] > prev1['Close'] > prev2['Close']
+        consecutive_down = latest['Close'] < prev1['Close'] < prev2['Close']
+
+        if consecutive_up:
+            signal_count_bullish += 1
+        elif consecutive_down:
+            signal_count_bearish += 1
+
+        # Contrarian logic (VERIFY THIS IS INTENDED)
+        if signal_count_bullish >= self.min_signals:
+            return 'sell'  # Contrarian: Predict green → SELL
+        elif signal_count_bearish >= self.min_signals:
+            return 'buy'  # Contrarian: Predict red → BUY
+
+        return None
+
+
+# === VIRTUAL POSITION ===
+class VirtualPosition:
+    """Represents a single virtual position for counterfactual tracking"""
+
+    def __init__(self, entry_price, tp_points, sl_points, direction, entry_segment, news_impact, entry_time):
+        self.id = str(uuid.uuid4())
+        self.entry_price = entry_price
+        self.tp_points = tp_points
+        self.sl_points = sl_points
+        self.direction = direction
+        self.entry_segment = entry_segment
+        self.news_impact = news_impact
+        self.entry_time = entry_time
+        self.exit_time = None
+        self.exit_price = None
+        self.exit_reason = None
+        self.pnl = None
+        self.is_active = True
+
+        # Calculate TP/SL prices
+        if direction == 'buy':
+            self.tp_price = entry_price + tp_points
+            self.sl_price = entry_price - sl_points
+        else:
+            self.tp_price = entry_price - tp_points
+            self.sl_price = entry_price + sl_points
+
+    def check_exit(self, current_price, timestamp):
+        """Check if position should exit"""
+        if not self.is_active:
+            return
+
+        # Check TP/SL
+        if self.direction == 'buy':
+            if current_price >= self.tp_price:
+                self.close('tp_hit', current_price, timestamp)
+            elif current_price <= self.sl_price:
+                self.close('sl_hit', current_price, timestamp)
+        else:
+            if current_price <= self.tp_price:
+                self.close('tp_hit', current_price, timestamp)
+            elif current_price >= self.sl_price:
+                self.close('sl_hit', current_price, timestamp)
+
+        # Check timeout (4 hours)
+        if self.is_active:
+            elapsed_hours = (timestamp - self.entry_time).total_seconds() / 3600
+            if elapsed_hours >= 4:
+                self.close('timeout', current_price, timestamp)
+
+    def close(self, reason, exit_price, timestamp):
+        """Close the virtual position"""
+        if not self.is_active:
+            return
+
+        self.is_active = False
+        self.exit_time = timestamp
+        self.exit_price = exit_price
+        self.exit_reason = reason
+
+        # Calculate P&L
+        if self.direction == 'buy':
+            self.pnl = exit_price - self.entry_price
+        else:
+            self.pnl = self.entry_price - exit_price
+
+        # Subtract commission
+        self.pnl -= 0.155
+
+
+# === ML MODEL ===
+class HistoricalMLTrainer:
+    """ML model for historical simulation with proper session tracking"""
+
+    def __init__(self):
+        self.training_data = []
+        self.model = None
+        self.scaler = StandardScaler()
+        self.feature_columns = []
+        self.retrain_interval = 300
+        self.confidence_threshold = 0.65
+        self.last_retrain_count = 0
+
+        # Session tracking for features
+        self.session_tracker = SessionTracker()
+
+    def extract_features_at_entry(self, entry_time, candles_df, price, session_stats):
+        """Extract features at trade entry time with all features properly calculated"""
+        features = {}
+
+        # Get candles up to entry time
+        available_candles = candles_df[candles_df.index <= entry_time]
+
+        if len(available_candles) < 20:
+            return None
+
+        # Use last 200 bars for indicators
+        indicator_data = available_candles.tail(200)
+        df = calculate_technical_indicators(indicator_data)
+        latest = df.iloc[-1]
+
+        # Technical features - exact format from production
+        features['RSI'] = float(latest.get('RSI', 50))
+        features['RSI_5'] = float(latest.get('RSI_5', 50))
+        features['MACD'] = float(latest.get('MACD', 0))
+        features['MACD_hist'] = float(latest.get('MACD_hist', 0))
+        features['BB_position'] = float(latest.get('BB_position', 0.5))
+        features['Volume_Ratio'] = float(latest.get('Volume_Ratio', 1))
+        features['ATR'] = float(latest.get('ATR', 1))
+        features['hour'] = entry_time.hour
+        features['day_of_week'] = entry_time.weekday()
+
+        # Session features
+        if entry_time.hour >= 18:
+            session_start = entry_time.replace(hour=18, minute=0, second=0, microsecond=0)
+        else:
+            session_start = (entry_time - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+
+        session_data = available_candles[available_candles.index >= session_start]
+
+        if len(session_data) > 0:
+            session_high = session_data['High'].max()
+            session_low = session_data['Low'].min()
+
+            # Find bars since high/low
+            high_idx = session_data['High'].idxmax()
+            low_idx = session_data['Low'].idxmin()
+
+            try:
+                features['bars_since_session_high'] = len(session_data) - session_data.index.get_loc(high_idx)
+                features['bars_since_session_low'] = len(session_data) - session_data.index.get_loc(low_idx)
+            except:
+                features['bars_since_session_high'] = 0
+                features['bars_since_session_low'] = 0
+
+            features['percent_from_session_high'] = ((session_high - price) / session_high) * 100 if session_high > 0 else 0
+            features['percent_from_session_low'] = ((price - session_low) / session_low) * 100 if session_low > 0 else 0
+            features['cumulative_session_delta'] = (session_data['Close'] - session_data['Open']).sum()
+            features['position_in_session_range'] = (price - session_low) / (session_high - session_low) if session_high > session_low else 0.5
+        else:
+            features['bars_since_session_high'] = 0
+            features['bars_since_session_low'] = 0
+            features['percent_from_session_high'] = 0
+            features['percent_from_session_low'] = 0
+            features['cumulative_session_delta'] = 0
+            features['position_in_session_range'] = 0.5
+
+        # PROPERLY CALCULATE Daily features
+        yesterday = (entry_time - timedelta(days=1)).date()
+        yesterday_data = available_candles[available_candles.index.date == yesterday]
+
+        if len(yesterday_data) > 0:
+            features['previous_day_range'] = float(yesterday_data['High'].max() - yesterday_data['Low'].min())
+
+            # Calculate overnight gap
+            yesterday_close = yesterday_data['Close'].iloc[-1]
+            today_data = available_candles[available_candles.index.date == entry_time.date()]
+            if len(today_data) > 0:
+                today_open = today_data['Open'].iloc[0]
+                features['overnight_gap_percent'] = ((today_open - yesterday_close) / yesterday_close) * 100 if yesterday_close != 0 else 0
+            else:
+                features['overnight_gap_percent'] = 0
+        else:
+            features['previous_day_range'] = 0
+            features['overnight_gap_percent'] = 0
+
+        # PROPERLY CALCULATE Weekly features
+        if len(available_candles) >= ML_CONFIG['weekly_lookback_bars']:
+            weekly_data = available_candles.tail(ML_CONFIG['weekly_lookback_bars'])
+            weekly_high = weekly_data['High'].max()
+            weekly_low = weekly_data['Low'].min()
+            if weekly_high > weekly_low:
+                features['position_in_5day_range'] = (price - weekly_low) / (weekly_high - weekly_low)
+            else:
+                features['position_in_5day_range'] = 0.5
+        else:
+            features['position_in_5day_range'] = 0.5
+
+        # Momentum features
+        if 'RSI' in df.columns and len(df) > 5:
+            features['rsi_rate_of_change'] = (df['RSI'].iloc[-1] - df['RSI'].iloc[-6]) / 5
+        else:
+            features['rsi_rate_of_change'] = 0
+
+        if 'MACD' in df.columns and len(df) > 2:
+            macd_velocity = df['MACD'].diff()
+            macd_acceleration = macd_velocity.diff()
+            features['macd_acceleration'] = float(macd_acceleration.iloc[-1]) if not pd.isna(macd_acceleration.iloc[-1]) else 0
+        else:
+            features['macd_acceleration'] = 0
+
+        if 'ATR' in df.columns and len(df) > 5:
+            current_atr = df['ATR'].iloc[-1]
+            past_atr = df['ATR'].iloc[-6]
+            features['atr_rate_of_change'] = (current_atr - past_atr) / past_atr if past_atr > 0 else 0
+        else:
+            features['atr_rate_of_change'] = 0
+
+        if len(df) > 3:
+            recent_vol = df['Volume'].iloc[-1]
+            avg_vol_3bars = df['Volume'].iloc[-4:-1].mean()
+            features['volume_acceleration'] = (recent_vol - avg_vol_3bars) / (avg_vol_3bars + 1)
+        else:
+            features['volume_acceleration'] = 0
+
+        # Price action features
+        bar_range = latest['High'] - latest['Low']
+        if bar_range > 0:
+            features['wick_ratio_upper'] = (latest['High'] - latest['Close']) / bar_range
+            features['wick_ratio_lower'] = (latest['Open'] - latest['Low']) / bar_range
+        else:
+            features['wick_ratio_upper'] = 0
+            features['wick_ratio_lower'] = 0
+
+        # Consecutive bars
+        consecutive_green = 0
+        consecutive_red = 0
+        for i in range(len(df)-1, -1, -1):
+            if df['Close'].iloc[i] > df['Open'].iloc[i]:
+                if consecutive_red > 0:
+                    break
+                consecutive_green += 1
+            else:
+                if consecutive_green > 0:
+                    break
+                consecutive_red += 1
+
+        features['consecutive_green_bars'] = consecutive_green
+        features['consecutive_red_bars'] = consecutive_red
+
+        # VWAP rejection
+        vwap = (df['Close'] * df['Volume']).sum() / df['Volume'].sum() if df['Volume'].sum() > 0 else latest['Close']
+        touch_distance = abs(latest['High'] - vwap) if latest['High'] > vwap else abs(latest['Low'] - vwap)
+        atr_value = latest.get('ATR', 1) if 'ATR' in df.columns else 1
+        features['rejection_from_vwap'] = 1 if touch_distance < atr_value * 0.2 else 0
+
+        # PROPERLY CALCULATED Session context features from session_stats
+        features['trades_today_count'] = session_stats['trades_today']
+        features['session_pnl_cumulative'] = session_stats['session_pnl']
+        features['win_rate_last_20_trades'] = session_stats['win_rate_last_20']
+        features['bars_since_last_trade'] = session_stats['bars_since_last_trade']
+        features['consecutive_wins'] = session_stats['consecutive_wins']
+        features['consecutive_losses'] = session_stats['consecutive_losses']
+
+        # News features
+        news_events = get_economic_events_for_date(entry_time.date())
+        features['is_news_day'] = 1 if news_events else 0
+        features['news_count'] = len(news_events)
+        features['has_extreme_news'] = 1 if any(e['impact'] == 'extreme' for e in news_events) else 0
+        features['has_high_news'] = 1 if any(e['impact'] == 'high' for e in news_events) else 0
+        features['has_medium_news'] = 1 if any(e['impact'] == 'medium' for e in news_events) else 0
+        features['has_fomc'] = 1 if any(e['type'] == 'FOMC' for e in news_events) else 0
+        features['has_nfp'] = 1 if any(e['type'] == 'NFP' for e in news_events) else 0
+        features['has_cpi'] = 1 if any(e['type'] == 'CPI' for e in news_events) else 0
+        features['has_ppi'] = 1 if any(e['type'] == 'PPI' for e in news_events) else 0
+        features['has_gdp'] = 1 if any(e['type'] == 'GDP' for e in news_events) else 0
+        features['has_retail_sales'] = 1 if any(e['type'] == 'RETAIL_SALES' for e in news_events) else 0
+
+        # Time segment features
+        segment_id, _ = get_current_time_segment(entry_time)
+        for sid in TIME_SEGMENTS.keys():
+            features[f'segment_{sid}'] = 1 if sid == segment_id else 0
+
+        # News impact features
+        news_impact = get_news_impact_for_date(entry_time.date())
+        for impact in NEWS_IMPACT_LEVELS.keys():
+            features[f'impact_{impact}'] = 1 if impact == news_impact else 0
+
+        return features
+
+    def add_completed_trade(self, trade):
+        """Add a completed trade with features"""
+        self.training_data.append(trade)
+
+    def retrain(self):
+        """Retrain model on accumulated trades"""
+        if len(self.training_data) < 300:
+            return False
+
+        try:
+            X = []
+            y = []
+
+            for trade in self.training_data[-15000:]:
+                if 'features' in trade and trade['features'] and 'outcome' in trade:
+                    features = trade['features']
+
+                    if trade.get('was_reversed', False):
+                        label = 1 if trade['outcome'] == 'success' else 0
+                    else:
+                        label = 0 if trade['outcome'] == 'success' else 1
+
+                    if not self.feature_columns:
+                        self.feature_columns = sorted(features.keys())
+
+                    feature_list = [features.get(k, 0) for k in self.feature_columns]
+                    X.append(feature_list)
+                    y.append(label)
+
+            if len(X) < 100:
+                return False
+
+            X = np.array(X)
+            y = np.array(y)
+
+            X_scaled = self.scaler.fit_transform(X)
+
+            self.model = {
+                'rf': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
+                'gb': GradientBoostingClassifier(n_estimators=50, max_depth=5, random_state=42)
+            }
+
+            self.model['rf'].fit(X_scaled, y)
+            self.model['gb'].fit(X_scaled, y)
+
+            logger.info(f"✅ Model retrained on {len(X)} trades")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error training model: {e}")
+            return False
+
+    def predict_reversal(self, features):
+        """Predict if signal should be reversed"""
+        if not self.model or not features:
+            return False, 0.5
+
+        try:
+            feature_list = [features.get(k, 0) for k in self.feature_columns]
+            features_scaled = self.scaler.transform([feature_list])
+
+            rf_prob = self.model['rf'].predict_proba(features_scaled)[0]
+            gb_prob = self.model['gb'].predict_proba(features_scaled)[0]
+
+            ensemble_prob = (rf_prob[1] + gb_prob[1]) / 2
+
+            should_reverse = ensemble_prob > self.confidence_threshold
+
+            return should_reverse, ensemble_prob
+
+        except Exception as e:
+            logger.error(f"Error predicting: {e}")
+            return False, 0.5
+
+
+# === SESSION TRACKER CLASS ===
+class SessionTracker:
+    """Track session statistics for feature calculation"""
+
+    def __init__(self):
+        self.trades_today = []
+        self.all_trades = deque(maxlen=20)  # Last 20 trades
+        self.session_pnl = 0
+        self.consecutive_wins = 0
+        self.consecutive_losses = 0
+        self.last_trade_time = None
+        self.current_date = None
+
+    def reset_daily_stats(self):
+        """Reset daily statistics"""
+        self.trades_today = []
+        self.session_pnl = 0
+        self.consecutive_wins = 0
+        self.consecutive_losses = 0
+
+    def update_on_new_day(self, date):
+        """Check if new day and reset if needed"""
+        if self.current_date != date:
+            self.reset_daily_stats()
+            self.current_date = date
+
+    def add_trade_result(self, trade_result, timestamp):
+        """Add a completed trade result"""
+        self.trades_today.append(trade_result)
+        self.all_trades.append(trade_result)
+        self.last_trade_time = timestamp
+
+        # Update session PnL
+        self.session_pnl += trade_result['pnl_points']
+
+        # Update consecutive wins/losses
+        if trade_result['pnl_points'] > 0:
+            self.consecutive_wins += 1
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+            self.consecutive_wins = 0
+
+    def get_stats(self, current_time):
+        """Get current session statistics"""
+        stats = {
+            'trades_today': len(self.trades_today),
+            'session_pnl': self.session_pnl,
+            'consecutive_wins': self.consecutive_wins,
+            'consecutive_losses': self.consecutive_losses,
+            'bars_since_last_trade': 1440,  # Default
+            'win_rate_last_20': 0.5  # Default
+        }
+
+        # Calculate bars since last trade
+        if self.last_trade_time:
+            minutes_diff = (current_time - self.last_trade_time).total_seconds() / 60
+            stats['bars_since_last_trade'] = int(minutes_diff)
+
+        # Calculate win rate for last 20 trades
+        if len(self.all_trades) > 0:
+            wins = sum(1 for t in self.all_trades if t['pnl_points'] > 0)
+            stats['win_rate_last_20'] = wins / len(self.all_trades)
+
+        return stats
+
+
+# === PENDING SIGNAL CLASS ===
+class PendingSignal:
+    """Represents a signal that will be executed on the next bar"""
+
+    def __init__(self, signal, segment_id, news_impact, signal_time, features):
+        self.signal = signal
+        self.segment_id = segment_id
+        self.news_impact = news_impact
+        self.signal_time = signal_time
+        self.features = features
+        self.ml_processed = False
+        self.executed_signal = None
+        self.was_reversed = False
+        self.ml_confidence = 0.5
+
+
+# === PERFORMANCE TRACKER CLASS ===
+class PerformanceTracker:
+    """Track ML vs Original strategy performance comparison"""
+
+    def __init__(self):
+        # ML Enhanced Performance
+        self.ml_enhanced_pnl = 0
+        self.ml_enhanced_trades = []
+        self.ml_enhanced_wins = 0
+        self.ml_enhanced_losses = 0
+
+        # Original Strategy Performance (counterfactual)
+        self.original_strategy_pnl = 0
+        self.original_strategy_trades = []
+        self.original_strategy_wins = 0
+        self.original_strategy_losses = 0
+
+        # Reversal tracking
+        self.total_reversals = 0
+        self.successful_reversals = 0
+
+    def add_trade_result(self, trade):
+        """Add completed trade and calculate both scenarios"""
+        # Always add to ML enhanced (actual) performance
+        self.ml_enhanced_pnl += trade['pnl_points']
+        self.ml_enhanced_trades.append(trade)
+
+        if trade['pnl_points'] > 0:
+            self.ml_enhanced_wins += 1
+        else:
+            self.ml_enhanced_losses += 1
+
+        # Calculate what would have happened with original signal
+        if trade.get('was_reversed', False):
+            # This trade was reversed by ML
+            self.total_reversals += 1
+
+            # Calculate original strategy outcome (opposite result)
+            # If ML reversal was profitable, original would have been unprofitable
+            original_pnl = -trade['pnl_points']  # Simplified assumption
+
+            if trade['pnl_points'] > 0:  # ML reversal was successful
+                self.successful_reversals += 1
+
+        else:
+            # Trade was not reversed, so original strategy would have same result
+            original_pnl = trade['pnl_points']
+
+        # Add to original strategy performance
+        self.original_strategy_pnl += original_pnl
+
+        original_trade_copy = trade.copy()
+        original_trade_copy['pnl_points'] = original_pnl
+        original_trade_copy['was_original'] = True
+        self.original_strategy_trades.append(original_trade_copy)
+
+        if original_pnl > 0:
+            self.original_strategy_wins += 1
+        else:
+            self.original_strategy_losses += 1
+
+    def get_comparison_metrics(self):
+        """Get comprehensive comparison between ML and original strategy"""
+        ml_total_trades = len(self.ml_enhanced_trades)
+        orig_total_trades = len(self.original_strategy_trades)
+
+        # Win rates
+        ml_win_rate = self.ml_enhanced_wins / ml_total_trades if ml_total_trades > 0 else 0
+        orig_win_rate = self.original_strategy_wins / orig_total_trades if orig_total_trades > 0 else 0
+
+        # Average wins/losses
+        ml_winning_trades = [t['pnl_points'] for t in self.ml_enhanced_trades if t['pnl_points'] > 0]
+        ml_losing_trades = [t['pnl_points'] for t in self.ml_enhanced_trades if t['pnl_points'] <= 0]
+
+        orig_winning_trades = [t['pnl_points'] for t in self.original_strategy_trades if t['pnl_points'] > 0]
+        orig_losing_trades = [t['pnl_points'] for t in self.original_strategy_trades if t['pnl_points'] <= 0]
+
+        ml_avg_win = np.mean(ml_winning_trades) if ml_winning_trades else 0
+        ml_avg_loss = np.mean(ml_losing_trades) if ml_losing_trades else 0
+        orig_avg_win = np.mean(orig_winning_trades) if orig_winning_trades else 0
+        orig_avg_loss = np.mean(orig_losing_trades) if orig_losing_trades else 0
+
+        # Performance difference
+        pnl_improvement = self.ml_enhanced_pnl - self.original_strategy_pnl
+        pnl_improvement_pct = (pnl_improvement / abs(self.original_strategy_pnl)) * 100 if self.original_strategy_pnl != 0 else 0
+
+        # Reversal success rate
+        reversal_success_rate = self.successful_reversals / self.total_reversals if self.total_reversals > 0 else 0
+        reversal_percentage = self.total_reversals / ml_total_trades if ml_total_trades > 0 else 0
+
+        return {
+            'ml_enhanced': {
+                'total_pnl': self.ml_enhanced_pnl,
+                'total_trades': ml_total_trades,
+                'wins': self.ml_enhanced_wins,
+                'losses': self.ml_enhanced_losses,
+                'win_rate': ml_win_rate,
+                'avg_win': ml_avg_win,
+                'avg_loss': ml_avg_loss,
+                'profit_factor': abs(ml_avg_win * self.ml_enhanced_wins / (ml_avg_loss * self.ml_enhanced_losses)) if ml_avg_loss < 0 and self.ml_enhanced_losses > 0 else 0
+            },
+            'original_strategy': {
+                'total_pnl': self.original_strategy_pnl,
+                'total_trades': orig_total_trades,
+                'wins': self.original_strategy_wins,
+                'losses': self.original_strategy_losses,
+                'win_rate': orig_win_rate,
+                'avg_win': orig_avg_win,
+                'avg_loss': orig_avg_loss,
+                'profit_factor': abs(orig_avg_win * self.original_strategy_wins / (orig_avg_loss * self.original_strategy_losses)) if orig_avg_loss < 0 and self.original_strategy_losses > 0 else 0
+            },
+            'ml_impact': {
+                'pnl_improvement': pnl_improvement,
+                'pnl_improvement_pct': pnl_improvement_pct,
+                'total_reversals': self.total_reversals,
+                'successful_reversals': self.successful_reversals,
+                'reversal_success_rate': reversal_success_rate,
+                'reversal_percentage': reversal_percentage,
+                'win_rate_improvement': ml_win_rate - orig_win_rate
+            }
+        }
+
+
+# === MAIN SIMULATION ENGINE WITH PNL REPORTING ===
+class HistoricalTradingSimulator:
+    """Complete backtesting system with FIXED chronological exit checking - no look-ahead bias"""
+
+    def __init__(self, start_date='2024-10-01', end_date='2025-08-31', symbol='NQ'):
+        self.start_date = datetime.strptime(start_date, '%Y-%m-%d')
+        self.end_date = datetime.strptime(end_date, '%Y-%m-%d')
+        self.symbol = symbol
+
+        # Data storage
+        self.trades_df = None
+        self.ohlcv_df = None
+        self.tick_processor = None  # Will be initialized after data loads
+
+        # Components
+        self.pinescript_strategy = PineScriptStrategy()
+        self.ml_trainer = HistoricalMLTrainer()
+
+        # Trade tracking
+        self.completed_trades = []
+        self.virtual_positions = {}
+        self.segment_performance_2d = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {
+            'wins': 0, 'losses': 0, 'total_pnl': 0, 'count': 0, 'avg_pnl': 0, 'expected_pnl': 0
+        })))
+        self.best_params_2d = {}
+
+        # FIXED: Add pending signals queue for realistic timing
+        self.pending_signals = []
+
+        # ENHANCED: Performance comparison tracking
+        self.performance_tracker = PerformanceTracker()
+
+        # Stats
+        self.total_signals = 0
+        self.total_trades = 0
+        self.total_reversals = 0
+        self.total_pnl_points = 0
+        self.trade_counter = 0
+
+        # Tracking for simulation
+        self.bars_processed = 0
+        self.ny_session_bars = 0
+
+        # Add daily/monthly tracking
+        self.daily_pnl = defaultdict(lambda: {
+            'trades_opened': 0,
+            'trades_closed': 0,
+            'pnl_points': 0,
+            'pnl_dollars': 0,
+            'wins': 0,
+            'losses': 0,
+            'closed_trades': []
+        })
+
+        self.monthly_pnl = defaultdict(lambda: {
+            'trades_opened': 0,
+            'trades_closed': 0,
+            'pnl_points': 0,
+            'pnl_dollars': 0,
+            'wins': 0,
+            'losses': 0,
+            'trading_days': 0,
+            'closed_trades': []
+        })
+
+        self.current_date = None
+        self.current_month = None
+        self.cumulative_pnl = 0
+
+        # Session tracking for proper feature calculation
+        self.session_tracker = SessionTracker()
+
+        logger.info(f"Initialized simulator for {symbol} from {start_date} to {end_date}")
+        logger.info(f"Trading hours: 6:00 AM - 4:30 PM ET")
+        logger.info(f"Position size: {CONTRACTS_PER_TRADE} contracts per trade")
+        logger.info(f"FIXED: No look-ahead bias - trades exit chronologically")
+        logger.info(f"ENHANCED: ML vs Original Strategy Performance Comparison")
+        logger.info(f"FIXED: Force close all trades at NY session end (4:30 PM ET)")
+
+    def load_aligned_data(self):
+        """Load and align historical data with optimized tick processor"""
+        self.trades_df, self.ohlcv_df = load_aligned_historical_data(
+            self.start_date, self.end_date, self.symbol
+        )
+
+        # Initialize optimized tick processor
+        if not self.trades_df.empty:
+            self.trades_df = self.trades_df.sort_index()
+            # Ensure index is datetime
+            if not isinstance(self.trades_df.index, pd.DatetimeIndex):
+                self.trades_df.index = pd.to_datetime(self.trades_df.index)
+
+            # Initialize the optimized tick processor
+            self.tick_processor = OptimizedTickProcessor(self.trades_df)
+
+            logger.info(f"Tick data range: {self.trades_df.index.min()} to {self.trades_df.index.max()}")
+            logger.info(f"Average ticks per minute: {len(self.trades_df) / (len(self.ohlcv_df) + 1):.1f}")
+
+        logger.info(f"Data loaded: {len(self.trades_df):,} trades, {len(self.ohlcv_df)} OHLCV bars")
+
+    def record_trade_open(self, trade, timestamp):
+        """Record when a trade is opened"""
+        date_key = timestamp.strftime('%Y-%m-%d')
+        month_key = timestamp.strftime('%Y-%m')
+
+        self.daily_pnl[date_key]['trades_opened'] += 1
+        self.monthly_pnl[month_key]['trades_opened'] += 1
+
+    def record_trade_close(self, trade):
+        """Record when a trade is closed and update session tracker"""
+        if not trade.get('exit_time'):
+            return
+
+        date_key = trade['exit_time'].strftime('%Y-%m-%d')
+        month_key = trade['exit_time'].strftime('%Y-%m')
+
+        # Update daily stats
+        daily = self.daily_pnl[date_key]
+        daily['trades_closed'] += 1
+        daily['pnl_points'] += trade['pnl_points']
+        daily['pnl_dollars'] += trade['pnl_dollars']
+        daily['closed_trades'].append(trade['trade_id'])
+
+        if trade['pnl_points'] > 0:
+            daily['wins'] += 1
+        else:
+            daily['losses'] += 1
+
+        # Update monthly stats
+        monthly = self.monthly_pnl[month_key]
+        monthly['trades_closed'] += 1
+        monthly['pnl_points'] += trade['pnl_points']
+        monthly['pnl_dollars'] += trade['pnl_dollars']
+        monthly['closed_trades'].append(trade['trade_id'])
+
+        if trade['pnl_points'] > 0:
+            monthly['wins'] += 1
+        else:
+            monthly['losses'] += 1
+
+        # Update session tracker
+        self.session_tracker.add_trade_result(trade, trade['exit_time'])
+
+        # ENHANCED: Update performance comparison tracker
+        self.performance_tracker.add_trade_result(trade)
+
+    def check_trade_exit_at_current_bar(self, trade, current_price, current_timestamp):
+        """Check if CURRENT bar triggers an exit - no look-ahead"""
+
+        # Skip if already exited
+        if trade.get('exit_time'):
+            return False
+
+        # Check if timeout (4 hours)
+        elapsed_hours = (current_timestamp - trade['entry_time']).total_seconds() / 3600
+        if elapsed_hours >= 4:
+            trade['exit_time'] = current_timestamp
+            trade['exit_price'] = current_price
+            trade['exit_reason'] = 'timeout'
+            return True
+
+        # Check TP/SL hits using tick data if available, otherwise use bar close
+        if self.tick_processor:
+            # Get tick prices for current bar only
+            tick_prices, tick_times = self.tick_processor.get_tick_prices_for_bar(current_timestamp)
+
+            if len(tick_prices) > 0:
+                # Check each tick in chronological order
+                for i, tick_price in enumerate(tick_prices):
+                    if trade['type'] == 'buy':
+                        if tick_price >= trade['tp_price']:
+                            trade['exit_time'] = current_timestamp
+                            trade['exit_price'] = trade['tp_price']  # Use exact TP
+                            trade['exit_reason'] = 'tp_hit'
+                            return True
+                        elif tick_price <= trade['sl_price']:
+                            trade['exit_time'] = current_timestamp
+                            trade['exit_price'] = trade['sl_price']  # Use exact SL
+                            trade['exit_reason'] = 'sl_hit'
+                            return True
+                    else:  # sell
+                        if tick_price <= trade['tp_price']:
+                            trade['exit_time'] = current_timestamp
+                            trade['exit_price'] = trade['tp_price']
+                            trade['exit_reason'] = 'tp_hit'
+                            return True
+                        elif tick_price >= trade['sl_price']:
+                            trade['exit_time'] = current_timestamp
+                            trade['exit_price'] = trade['sl_price']
+                            trade['exit_reason'] = 'sl_hit'
+                            return True
+            else:
+                # No tick data for this bar, use close price
+                current_price = current_price
+
+        # Use bar close price if no tick data or no exit triggered by ticks
+        if trade['type'] == 'buy':
+            if current_price >= trade['tp_price']:
+                trade['exit_time'] = current_timestamp
+                trade['exit_price'] = trade['tp_price']
+                trade['exit_reason'] = 'tp_hit'
+                return True
+            elif current_price <= trade['sl_price']:
+                trade['exit_time'] = current_timestamp
+                trade['exit_price'] = trade['sl_price']
+                trade['exit_reason'] = 'sl_hit'
+                return True
+        else:  # sell
+            if current_price <= trade['tp_price']:
+                trade['exit_time'] = current_timestamp
+                trade['exit_price'] = trade['tp_price']
+                trade['exit_reason'] = 'tp_hit'
+                return True
+            elif current_price >= trade['sl_price']:
+                trade['exit_time'] = current_timestamp
+                trade['exit_price'] = trade['sl_price']
+                trade['exit_reason'] = 'sl_hit'
+                return True
+
+        return False
+
+    def close_all_trades_at_session_end(self, active_trades, timestamp, current_price):
+        """Force close all active trades at NY session end (4:30 PM ET)"""
+        trades_to_close = []
+
+        for trade in active_trades[:]:
+            if not trade.get('exit_time'):
+                # Force close at session end
+                trade['exit_time'] = timestamp
+                trade['exit_price'] = current_price
+                trade['exit_reason'] = 'session_end'
+
+                # Calculate P&L with 35 contracts
+                if trade['type'] == 'buy':
+                    trade['pnl_points'] = trade['exit_price'] - trade['entry_price']
+                else:
+                    trade['pnl_points'] = trade['entry_price'] - trade['exit_price']
+
+                trade['pnl_points'] -= 0.155  # Commission
+                trade['pnl_dollars'] = trade['pnl_points'] * POINTS_VALUE * CONTRACTS_PER_TRADE
+                trade['outcome'] = 'success' if trade['pnl_points'] > 0 else 'failure'
+
+                # Add to ML training data
+                self.ml_trainer.add_completed_trade(trade)
+
+                trades_to_close.append(trade)
+
+                logger.info(f"   📍 SESSION END: Force closed {trade['type']} trade @ {current_price:.2f} "
+                          f"P&L: {trade['pnl_points']:.2f} pts (${trade['pnl_dollars']:.2f})")
+
+        # Remove closed trades from active list and add to completed
+        for closed_trade in trades_to_close:
+            if closed_trade in active_trades:
+                active_trades.remove(closed_trade)
+                self.completed_trades.append(closed_trade)
+
+                if closed_trade.get('pnl_points') is not None:
+                    self.total_pnl_points += closed_trade['pnl_points']
+                    self.record_trade_close(closed_trade)
+
+        # Also close all virtual positions at session end
+        for vp_id in list(self.virtual_positions.keys()):
+            vp = self.virtual_positions[vp_id]
+            if vp.is_active:
+                vp.close('session_end', current_price, timestamp)
+                self.record_virtual_outcome(vp)
+                del self.virtual_positions[vp_id]
+
+        return len(trades_to_close)
+
+    def print_daily_summary(self, date_str):
+        """Print daily PnL summary"""
+        if date_str not in self.daily_pnl:
+            return
+
+        daily = self.daily_pnl[date_str]
+
+        # Only print if there was activity
+        if daily['trades_opened'] == 0 and daily['trades_closed'] == 0:
+            return
+
+        win_rate = (daily['wins'] / daily['trades_closed'] * 100) if daily['trades_closed'] > 0 else 0
+        self.cumulative_pnl += daily['pnl_points']
+
+        print("\n" + "="*60)
+        print(f"📅 DAILY SUMMARY: {date_str}")
+        print("="*60)
+        print(f"  Trades Opened:  {daily['trades_opened']}")
+        print(f"  Trades Closed:  {daily['trades_closed']}")
+        print(f"  Wins/Losses:    {daily['wins']}/{daily['losses']}")
+        print(f"  Win Rate:       {win_rate:.1f}%")
+        print(f"  Daily P&L:      {daily['pnl_points']:.2f} pts (${daily['pnl_dollars']:,.2f})")
+        print(f"  Cumulative P&L: {self.cumulative_pnl:.2f} pts (${self.cumulative_pnl * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+
+        # Show best and worst trade if any
+        if daily['closed_trades']:
+            trades_today = [t for t in self.completed_trades if t['trade_id'] in daily['closed_trades']]
+            if trades_today:
+                best_trade = max(trades_today, key=lambda x: x['pnl_points'])
+                worst_trade = min(trades_today, key=lambda x: x['pnl_points'])
+                print(f"  Best Trade:     {best_trade['pnl_points']:.2f} pts (${best_trade['pnl_dollars']:,.2f})")
+                print(f"  Worst Trade:    {worst_trade['pnl_points']:.2f} pts (${worst_trade['pnl_dollars']:,.2f})")
+        print("="*60)
+
+    def print_monthly_summary(self, month_str):
+        """Print monthly PnL summary"""
+        if month_str not in self.monthly_pnl:
+            return
+
+        monthly = self.monthly_pnl[month_str]
+
+        # Only print if there was activity
+        if monthly['trades_closed'] == 0:
+            return
+
+        # Count trading days
+        trading_days = len([d for d in self.daily_pnl.keys() if d.startswith(month_str)])
+        monthly['trading_days'] = trading_days
+
+        win_rate = (monthly['wins'] / monthly['trades_closed'] * 100) if monthly['trades_closed'] > 0 else 0
+        avg_daily_pnl = monthly['pnl_points'] / trading_days if trading_days > 0 else 0
+
+        print("\n" + "="*70)
+        print(f"📊 MONTHLY SUMMARY: {month_str}")
+        print("="*70)
+        print(f"  Trading Days:       {trading_days}")
+        print(f"  Total Trades Open:  {monthly['trades_opened']}")
+        print(f"  Total Trades Closed:{monthly['trades_closed']}")
+        print(f"  Wins/Losses:        {monthly['wins']}/{monthly['losses']}")
+        print(f"  Win Rate:           {win_rate:.1f}%")
+        print(f"  Monthly P&L:        {monthly['pnl_points']:.2f} pts (${monthly['pnl_dollars']:,.2f})")
+        print(f"  Avg Daily P&L:      {avg_daily_pnl:.2f} pts (${avg_daily_pnl * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+        print(f"  Cumulative P&L:     {self.cumulative_pnl:.2f} pts (${self.cumulative_pnl * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+
+        # Show distribution of daily results
+        daily_pnls = []
+        for date_key in sorted(self.daily_pnl.keys()):
+            if date_key.startswith(month_str):
+                daily_pnls.append(self.daily_pnl[date_key]['pnl_points'])
+
+        if daily_pnls:
+            positive_days = sum(1 for p in daily_pnls if p > 0)
+            negative_days = sum(1 for p in daily_pnls if p < 0)
+            flat_days = sum(1 for p in daily_pnls if p == 0)
+            print(f"  Daily Results:      {positive_days} positive, {negative_days} negative, {flat_days} flat")
+            print(f"  Best Day:           {max(daily_pnls):.2f} pts (${max(daily_pnls) * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+            print(f"  Worst Day:          {min(daily_pnls):.2f} pts (${min(daily_pnls) * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+        print("="*70)
+
+    def print_final_summary(self):
+        """Print complete simulation summary with ML vs Original comparison and daily profitability stats"""
+        print("\n" + "="*70)
+        print("📈 COMPLETE SIMULATION SUMMARY")
+        print("="*70)
+
+        # Overall stats
+        total_wins = sum(1 for t in self.completed_trades if t['pnl_points'] > 0)
+        total_losses = sum(1 for t in self.completed_trades if t['pnl_points'] <= 0)
+        overall_win_rate = (total_wins / len(self.completed_trades) * 100) if self.completed_trades else 0
+
+        # ENHANCED: Calculate daily profitability statistics
+        daily_pnl_values = [v['pnl_dollars'] for v in self.daily_pnl.values() if v['trades_closed'] > 0]
+        profitable_days = [p for p in daily_pnl_values if p > 0]
+        losing_days = [p for p in daily_pnl_values if p < 0]
+
+        num_winning_days = len(profitable_days)
+        num_losing_days = len(losing_days)
+        total_trading_days = len(daily_pnl_values)
+
+        pct_profitable_days = (num_winning_days / total_trading_days * 100) if total_trading_days > 0 else 0
+        avg_trade_per_day = len(self.completed_trades) / total_trading_days if total_trading_days > 0 else 0
+        avg_winning_day = np.mean(profitable_days) if profitable_days else 0
+        avg_losing_day = np.mean(losing_days) if losing_days else 0
+
+        print(f"  Simulation Period:    {self.start_date.strftime('%Y-%m-%d')} to {self.end_date.strftime('%Y-%m-%d')}")
+        print(f"  Position Size:        {CONTRACTS_PER_TRADE} contracts per trade")
+        print(f"  Total Trading Days:   {total_trading_days}")
+        print(f"  Total Trades:         {len(self.completed_trades)}")
+        print(f"  Total Wins/Losses:    {total_wins}/{total_losses}")
+        print(f"  Overall Win Rate:     {overall_win_rate:.1f}%")
+        print(f"  Total P&L:            {self.total_pnl_points:.2f} pts (${self.total_pnl_points * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+
+        # ENHANCED: Daily profitability metrics
+        print("\n" + "-"*70)
+        print("📊 DAILY PROFITABILITY METRICS")
+        print("-"*70)
+        print(f"  Winning Days:         {num_winning_days}")
+        print(f"  Losing Days:          {num_losing_days}")
+        print(f"  Profitable Days:      {pct_profitable_days:.1f}%")
+        print(f"  Avg Trades Per Day:   {avg_trade_per_day:.1f}")
+        print(f"  Avg Winning Day:      ${avg_winning_day:,.2f}")
+        print(f"  Avg Losing Day:       ${avg_losing_day:,.2f}")
+        if profitable_days:
+            print(f"  Best Day:             ${max(profitable_days):,.2f}")
+        if losing_days:
+            print(f"  Worst Day:            ${min(losing_days):,.2f}")
+
+        if self.completed_trades:
+            winning_trades = [t['pnl_points'] for t in self.completed_trades if t['pnl_points'] > 0]
+            losing_trades = [t['pnl_points'] for t in self.completed_trades if t['pnl_points'] <= 0]
+
+            if winning_trades:
+                avg_win = np.mean(winning_trades)
+                print(f"\n  Average Win:          {avg_win:.2f} pts (${avg_win * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+            if losing_trades:
+                avg_loss = np.mean(losing_trades)
+                print(f"  Average Loss:         {avg_loss:.2f} pts (${avg_loss * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+
+            # Best/worst months
+            if self.monthly_pnl:
+                best_month = max(self.monthly_pnl.items(), key=lambda x: x[1]['pnl_points'])
+                worst_month = min(self.monthly_pnl.items(), key=lambda x: x[1]['pnl_points'])
+                print(f"  Best Month:           {best_month[0]} ({best_month[1]['pnl_points']:.2f} pts / ${best_month[1]['pnl_dollars']:,.2f})")
+                print(f"  Worst Month:          {worst_month[0]} ({worst_month[1]['pnl_points']:.2f} pts / ${worst_month[1]['pnl_dollars']:,.2f})")
+
+        # ENHANCED: ML vs Original Strategy Comparison
+        print("\n" + "="*70)
+        print("🤖 ML vs ORIGINAL STRATEGY COMPARISON")
+        print("="*70)
+
+        comparison = self.performance_tracker.get_comparison_metrics()
+
+        ml_metrics = comparison['ml_enhanced']
+        orig_metrics = comparison['original_strategy']
+        ml_impact = comparison['ml_impact']
+
+        print("ML ENHANCED STRATEGY:")
+        print(f"  Total P&L:            {ml_metrics['total_pnl']:.2f} pts (${ml_metrics['total_pnl'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+        print(f"  Win Rate:             {ml_metrics['win_rate']:.1%}")
+        print(f"  Average Win:          {ml_metrics['avg_win']:.2f} pts (${ml_metrics['avg_win'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+        print(f"  Average Loss:         {ml_metrics['avg_loss']:.2f} pts (${ml_metrics['avg_loss'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+        print(f"  Profit Factor:        {ml_metrics['profit_factor']:.2f}")
+
+        print("\nORIGINAL STRATEGY (counterfactual):")
+        print(f"  Total P&L:            {orig_metrics['total_pnl']:.2f} pts (${orig_metrics['total_pnl'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+        print(f"  Win Rate:             {orig_metrics['win_rate']:.1%}")
+        print(f"  Average Win:          {orig_metrics['avg_win']:.2f} pts (${orig_metrics['avg_win'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+        print(f"  Average Loss:         {orig_metrics['avg_loss']:.2f} pts (${orig_metrics['avg_loss'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+        print(f"  Profit Factor:        {orig_metrics['profit_factor']:.2f}")
+
+        print("\nML IMPACT ANALYSIS:")
+        print(f"  P&L Improvement:      {ml_impact['pnl_improvement']:.2f} pts (${ml_impact['pnl_improvement'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+        print(f"  Performance Boost:    {ml_impact['pnl_improvement_pct']:.1f}%")
+        print(f"  Win Rate Improvement: {ml_impact['win_rate_improvement']:.1%}")
+        print(f"  Total Reversals:      {ml_impact['total_reversals']}")
+        print(f"  Successful Reversals: {ml_impact['successful_reversals']}")
+        print(f"  Reversal Success Rate:{ml_impact['reversal_success_rate']:.1%}")
+        print(f"  Reversal Percentage:  {ml_impact['reversal_percentage']:.1%}")
+
+        # Summary verdict
+        print(f"\n{'🎯 ML VERDICT:' if ml_impact['pnl_improvement'] > 0 else '❌ ML VERDICT:'}")
+        if ml_impact['pnl_improvement'] > 0:
+            improvement_ratio = ml_impact['pnl_improvement'] / abs(orig_metrics['total_pnl']) if orig_metrics['total_pnl'] != 0 else 0
+            if improvement_ratio > 0.10:
+                print(f"  SIGNIFICANT IMPROVEMENT: ML added {ml_impact['pnl_improvement']:.2f} pts value (${ml_impact['pnl_improvement'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+            elif improvement_ratio > 0.05:
+                print(f"  MODERATE IMPROVEMENT: ML added {ml_impact['pnl_improvement']:.2f} pts value (${ml_impact['pnl_improvement'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+            else:
+                print(f"  MARGINAL IMPROVEMENT: ML added {ml_impact['pnl_improvement']:.2f} pts value (${ml_impact['pnl_improvement'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+        else:
+            print(f"  ML DETRACTED VALUE: Lost {abs(ml_impact['pnl_improvement']):.2f} pts vs original strategy (${abs(ml_impact['pnl_improvement']) * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f})")
+
+        print("="*70)
+
+    def get_price_at_timestamp(self, timestamp):
+        """Get price using binary search on sorted tick data - much faster"""
+        if self.tick_processor:
+            # Simulate 100ms execution delay
+            execution_time = timestamp + timedelta(milliseconds=100)
+
+            # Binary search for the first tick after execution time
+            idx = np.searchsorted(self.tick_processor.tick_times,
+                                pd.Timestamp(execution_time).to_datetime64(),
+                                side='right')
+
+            if idx < len(self.tick_processor.tick_prices):
+                return float(self.tick_processor.tick_prices[idx])
+
+        # Fallback to OHLCV
+        if timestamp in self.ohlcv_df.index:
+            return float(self.ohlcv_df.loc[timestamp, 'Close'])
+
+        return None
+
+    def create_virtual_positions_for_signal(self, entry_price, direction, segment, news_impact, timestamp):
+        """Create 36 virtual positions for counterfactual analysis"""
+        positions = []
+
+        for tp in TP_SL_GRID['tp_values']:
+            for sl in TP_SL_GRID['sl_values']:
+                vp = VirtualPosition(
+                    entry_price=entry_price,
+                    tp_points=tp,
+                    sl_points=sl,
+                    direction=direction,
+                    entry_segment=segment,
+                    news_impact=news_impact,
+                    entry_time=timestamp
+                )
+                self.virtual_positions[vp.id] = vp
+                positions.append(vp)
+
+        return positions
+
+    def update_virtual_positions(self, current_price, timestamp):
+        """Update all active virtual positions and clean up closed ones"""
+        closed_positions = []
+
+        for vp_id, vp in list(self.virtual_positions.items()):
+            if vp.is_active:
+                vp.check_exit(current_price, timestamp)
+                if not vp.is_active:
+                    self.record_virtual_outcome(vp)
+                    closed_positions.append(vp_id)
+
+        # Remove closed positions from dictionary to prevent memory bloat
+        for vp_id in closed_positions:
+            del self.virtual_positions[vp_id]
+
+    def record_virtual_outcome(self, vp):
+        """Record virtual position outcome for optimization"""
+        segment = vp.entry_segment
+        news_impact = vp.news_impact
+        key = f"tp{vp.tp_points}_sl{vp.sl_points}"
+
+        stats = self.segment_performance_2d[segment][news_impact][key]
+        stats['count'] += 1
+
+        if vp.exit_reason == 'tp_hit':
+            stats['wins'] += 1
+        else:
+            stats['losses'] += 1
+
+        stats['total_pnl'] += vp.pnl
+
+        if stats['count'] > 0:
+            stats['avg_pnl'] = stats['total_pnl'] / stats['count']
+            prior_count = 10
+            prior_mean = 0
+            posterior_count = prior_count + stats['count']
+            stats['expected_pnl'] = (prior_count * prior_mean + stats['count'] * stats['avg_pnl']) / posterior_count
+
+    def get_best_params_for_context(self, segment_id, news_impact):
+        """Get optimal TP/SL for given context WITH news impact multipliers applied"""
+        cell_key = f"{segment_id}_{news_impact}"
+
+        if cell_key in self.best_params_2d:
+            tp, sl = self.best_params_2d[cell_key]
+        else:
+            # Get default values
+            tp = TIME_SEGMENTS[segment_id]['default_tp'][news_impact]
+            sl = TIME_SEGMENTS[segment_id]['default_sl'][news_impact]
+
+        # Apply news impact multipliers
+        tp_multiplier = NEWS_IMPACT_LEVELS[news_impact]['tp_multiplier']
+        sl_multiplier = NEWS_IMPACT_LEVELS[news_impact]['sl_multiplier']
+
+        # Adjust TP/SL based on news impact
+        tp = int(tp * tp_multiplier)
+        sl = int(sl * sl_multiplier)
+
+        return tp, sl
+
+    def optimize_parameters(self):
+        """Optimize TP/SL parameters based on virtual results"""
+        updates_made = 0
+
+        for segment_id in TIME_SEGMENTS.keys():
+            for news_impact in NEWS_IMPACT_LEVELS.keys():
+                if segment_id not in self.segment_performance_2d:
+                    continue
+                if news_impact not in self.segment_performance_2d[segment_id]:
+                    continue
+
+                cell_stats = self.segment_performance_2d[segment_id][news_impact]
+
+                best_key = None
+                best_expected_pnl = float('-inf')
+
+                for key, stats in cell_stats.items():
+                    if stats['count'] >= 20:
+                        if stats['expected_pnl'] > best_expected_pnl:
+                            best_expected_pnl = stats['expected_pnl']
+                            best_key = key
+
+                if best_key:
+                    parts = best_key.replace('tp', '').replace('sl', '').split('_')
+                    new_tp = int(parts[0])
+                    new_sl = int(parts[1])
+
+                    cell_key = f"{segment_id}_{news_impact}"
+                    self.best_params_2d[cell_key] = (new_tp, new_sl)
+                    updates_made += 1
+
+        if updates_made > 0:
+            logger.info(f"✅ Optimized {updates_made} parameter sets")
+
+    def run_simulation(self):
+        """Run the complete simulation with FIXED chronological exit checking and session-end closure"""
+        if self.ohlcv_df is None or self.ohlcv_df.empty:
+            logger.error("No OHLCV data loaded!")
+            return None
+
+        if self.trades_df is None or self.trades_df.empty:
+            logger.error("No tick data loaded!")
+            return None
+
+        logger.info("=" * 60)
+        logger.info("Starting simulation with CHRONOLOGICAL exit checking...")
+        logger.info("FIXED: No look-ahead bias - trades exit only when price hits target")
+        logger.info("ENHANCED: ML vs Original Strategy Performance Comparison")
+        logger.info("FIXED: Force close all trades at NY session end (4:30 PM ET)")
+        logger.info(f"Position Size: {CONTRACTS_PER_TRADE} contracts per trade")
+        logger.info("=" * 60)
+
+        # Determine start index based on available data
+        start_index = min(max(200, min(7200, len(self.ohlcv_df) // 4)), len(self.ohlcv_df) - 240)
+        end_index = len(self.ohlcv_df) - ML_CONFIG['max_trade_duration_bars'] - 1  # -1 to account for next bar entry
+
+        logger.info(f"Simulation configuration:")
+        logger.info(f"  Total bars available: {len(self.ohlcv_df)}")
+        logger.info(f"  Start index: {start_index}")
+        logger.info(f"  End index: {end_index}")
+        logger.info(f"  Bars to process: {end_index - start_index}")
+
+        # Track active trades
+        active_trades = []
+        last_signal_bar = -float('inf')
+
+        # Initialize date tracking
+        self.current_date = None
+        self.current_month = None
+
+        # Performance tracking
+        start_time = time.time()
+        last_update_time = start_time
+
+        for i in range(start_index, end_index):
+            self.bars_processed += 1
+            timestamp = self.ohlcv_df.index[i]
+
+            # Update session tracker for new day
+            self.session_tracker.update_on_new_day(timestamp.date())
+
+            # Check for day/month change
+            date_str = timestamp.strftime('%Y-%m-%d')
+            month_str = timestamp.strftime('%Y-%m')
+
+            # Print daily summary when day changes
+            if self.current_date and date_str != self.current_date:
+                self.print_daily_summary(self.current_date)
+
+            # Print monthly summary when month changes
+            if self.current_month and month_str != self.current_month:
+                self.print_monthly_summary(self.current_month)
+
+            self.current_date = date_str
+            self.current_month = month_str
+
+            # Get current price from tick data (optimized)
+            current_price = self.get_price_at_timestamp(timestamp)
+            if current_price is None or current_price == 0:
+                continue
+
+            # Update virtual positions
+            self.update_virtual_positions(current_price, timestamp)
+
+            # FIXED: Check if we're at NY session end (4:30 PM ET) and force close all trades
+            if is_ny_session_end(timestamp):
+                num_closed = self.close_all_trades_at_session_end(active_trades, timestamp, current_price)
+                if num_closed > 0:
+                    logger.info(f"🔔 NY Session End at {timestamp}: Force closed {num_closed} active trades")
+
+            # Check if NY session for NEW trading
+            if is_ny_session(timestamp):
+                self.ny_session_bars += 1
+            else:
+                continue  # Skip new signal detection outside NY session
+
+            # Get data up to current point
+            candles_up_to_now = self.ohlcv_df.iloc[:i + 1]
+
+            # FIXED: Execute pending signals from previous bar (realistic entry timing)
+            if self.pending_signals:
+                signals_to_execute = []
+                signals_to_keep = []
+
+                for pending_signal in self.pending_signals:
+                    # Check if this signal should be executed on this bar
+                    signal_bar_time = pending_signal.signal_time
+                    # Entry should happen on the next bar after signal detection
+                    expected_entry_time = signal_bar_time + timedelta(minutes=1)
+
+                    if timestamp >= expected_entry_time:
+                        signals_to_execute.append(pending_signal)
+                    else:
+                        signals_to_keep.append(pending_signal)
+
+                # Update pending signals list
+                self.pending_signals = signals_to_keep
+
+                # Execute pending signals
+                for pending_signal in signals_to_execute:
+                    self.execute_pending_signal(pending_signal, active_trades, timestamp, current_price, candles_up_to_now)
+
+            # Check for NEW signal at current bar close
+            signal_data = candles_up_to_now.tail(200)
+            signal = self.pinescript_strategy.calculate_signals(signal_data)
+
+            if signal:
+                self.total_signals += 1
+                last_signal_bar = i
+
+                # Get session stats for features
+                session_stats = self.session_tracker.get_stats(timestamp)
+
+                # Extract features at signal detection time
+                features = self.ml_trainer.extract_features_at_entry(
+                    timestamp, candles_up_to_now, current_price, session_stats
+                )
+                segment_id, _ = get_current_time_segment(timestamp)
+                news_impact = get_news_impact_for_date(timestamp.date())
+
+                # Create pending signal for execution on next bar
+                pending_signal = PendingSignal(
+                    signal=signal,
+                    segment_id=segment_id,
+                    news_impact=news_impact,
+                    signal_time=timestamp,
+                    features=features
+                )
+
+                self.pending_signals.append(pending_signal)
+
+                logger.info(f"📍 Signal #{self.total_signals} detected at {timestamp.strftime('%Y-%m-%d %H:%M')}: "
+                          f"{signal} (will execute on next bar)")
+
+            # FIXED: Check exits for active trades CHRONOLOGICALLY - no look-ahead
+            trades_to_close = []
+            for trade in active_trades[:]:
+                # Skip trades that haven't started yet
+                if i <= trade['entry_bar_index']:
+                    continue
+
+                # Check if THIS bar triggers an exit
+                if self.check_trade_exit_at_current_bar(trade, current_price, timestamp):
+                    # Calculate P&L with 35 contracts
+                    if trade['type'] == 'buy':
+                        trade['pnl_points'] = trade['exit_price'] - trade['entry_price']
+                    else:
+                        trade['pnl_points'] = trade['entry_price'] - trade['exit_price']
+
+                    trade['pnl_points'] -= 0.155  # Commission
+                    trade['pnl_dollars'] = trade['pnl_points'] * POINTS_VALUE * CONTRACTS_PER_TRADE
+                    trade['outcome'] = 'success' if trade['pnl_points'] > 0 else 'failure'
+
+                    # Add to ML training data
+                    self.ml_trainer.add_completed_trade(trade)
+
+                    trades_to_close.append(trade)
+
+            # Remove closed trades
+            for closed_trade in trades_to_close:
+                if closed_trade in active_trades:
+                    active_trades.remove(closed_trade)
+                    self.completed_trades.append(closed_trade)
+
+                    if closed_trade.get('pnl_points') is not None:
+                        self.total_pnl_points += closed_trade['pnl_points']
+
+                        # Record the close
+                        self.record_trade_close(closed_trade)
+
+                        logger.info(f"   ✅ Trade closed: {closed_trade['exit_reason']} @ "
+                                  f"{closed_trade['exit_price']:.2f} P&L: {closed_trade['pnl_points']:.2f} pts (${closed_trade['pnl_dollars']:,.2f})")
+
+                        # Retrain ML periodically
+                        if len(self.ml_trainer.training_data) >= self.ml_trainer.last_retrain_count + ML_CONFIG['retrain_every_n_trades']:
+                            if self.ml_trainer.retrain():
+                                self.ml_trainer.last_retrain_count = len(self.ml_trainer.training_data)
+                                logger.info(f"   🤖 ML model retrained at {self.ml_trainer.last_retrain_count} trades")
+
+                        # Optimize parameters periodically
+                        if len(self.completed_trades) % 100 == 0:
+                            self.optimize_parameters()
+
+            # Progress update with performance metrics
+            if i % 5000 == 0:
+                current_time = time.time()
+                elapsed = current_time - start_time
+                bars_per_second = self.bars_processed / elapsed
+                remaining_bars = end_index - i
+                eta_seconds = remaining_bars / bars_per_second if bars_per_second > 0 else 0
+
+                pct_complete = ((i - start_index) / (end_index - start_index)) * 100
+                active_virtual = sum(1 for vp in self.virtual_positions.values() if vp.is_active)
+
+                # Get current ML metrics
+                comparison = self.performance_tracker.get_comparison_metrics()
+                ml_improvement = comparison['ml_impact']['pnl_improvement']
+
+                logger.info(f"Progress: {pct_complete:.1f}% | Active: {len(active_trades)} | "
+                          f"Virtual: {active_virtual} | Pending: {len(self.pending_signals)} | "
+                          f"Completed: {len(self.completed_trades)} | ML Boost: {ml_improvement:.1f} pts | "
+                          f"Speed: {bars_per_second:.0f} bars/sec | "
+                          f"ETA: {eta_seconds/60:.1f} min")
+
+                last_update_time = current_time
+
+        # Execute any remaining pending signals
+        if self.pending_signals:
+            logger.info(f"Executing {len(self.pending_signals)} remaining pending signals...")
+            for pending_signal in self.pending_signals:
+                final_timestamp = self.ohlcv_df.index[-1]
+                final_price = self.ohlcv_df['Close'].iloc[-1]
+                final_candles = self.ohlcv_df.iloc[:len(self.ohlcv_df)]
+                self.execute_pending_signal(pending_signal, active_trades, final_timestamp, final_price, final_candles)
+
+        # Print final performance stats
+        total_time = time.time() - start_time
+        logger.info(f"\n⚡ Simulation completed in {total_time/60:.1f} minutes")
+        logger.info(f"   Processing speed: {self.bars_processed/total_time:.0f} bars/second")
+        logger.info(f"   Tick processing speed: {len(self.trades_df)/total_time/1000:.1f}K ticks/second")
+
+        # Print final day and month summaries
+        if self.current_date:
+            self.print_daily_summary(self.current_date)
+        if self.current_month:
+            self.print_monthly_summary(self.current_month)
+
+        # Close remaining active trades
+        logger.info(f"\nClosing {len(active_trades)} remaining active trades...")
+        for trade in active_trades:
+            # Use last available price
+            if self.tick_processor:
+                last_price = float(self.tick_processor.tick_prices[-1])
+                trade['exit_time'] = pd.Timestamp(self.tick_processor.tick_times[-1])
+            else:
+                last_price = self.ohlcv_df['Close'].iloc[-1]
+                trade['exit_time'] = self.ohlcv_df.index[-1]
+
+            trade['exit_price'] = last_price
+            trade['exit_reason'] = 'simulation_end'
+
+            if trade['type'] == 'buy':
+                trade['pnl_points'] = trade['exit_price'] - trade['entry_price']
+            else:
+                trade['pnl_points'] = trade['entry_price'] - trade['exit_price']
+
+            trade['pnl_points'] -= 0.155
+            trade['pnl_dollars'] = trade['pnl_points'] * POINTS_VALUE * CONTRACTS_PER_TRADE
+            trade['outcome'] = 'success' if trade['pnl_points'] > 0 else 'failure'
+
+            self.completed_trades.append(trade)
+            self.total_pnl_points += trade['pnl_points']
+            self.record_trade_close(trade)
+
+        # Close remaining virtual positions
+        for vp in list(self.virtual_positions.values()):
+            if vp.is_active:
+                last_price = self.ohlcv_df['Close'].iloc[-1]
+                vp.close('simulation_end', last_price, self.ohlcv_df.index[-1])
+                self.record_virtual_outcome(vp)
+
+        # Clear virtual positions dictionary
+        self.virtual_positions.clear()
+
+        # Print final summary
+        self.print_final_summary()
+
+        return self.get_results()
+
+    def execute_pending_signal(self, pending_signal, active_trades, entry_timestamp, entry_price, candles_up_to_now):
+        """Execute a pending signal with proper ML processing and position management"""
+
+        # Apply ML reversal logic if not already processed
+        if not pending_signal.ml_processed:
+            executed_signal = pending_signal.signal
+            was_reversed = False
+            ml_confidence = 0.5
+
+            if pending_signal.features and self.ml_trainer.model:
+                should_reverse, ml_confidence = self.ml_trainer.predict_reversal(pending_signal.features)
+                if should_reverse:
+                    executed_signal = 'sell' if pending_signal.signal == 'buy' else 'buy'
+                    was_reversed = True
+                    self.total_reversals += 1
+
+            pending_signal.executed_signal = executed_signal
+            pending_signal.was_reversed = was_reversed
+            pending_signal.ml_confidence = ml_confidence
+            pending_signal.ml_processed = True
+
+        # Close opposite positions
+        positions_closed = 0
+        for trade in active_trades[:]:
+            opposite_direction = False
+            if pending_signal.executed_signal == 'buy' and trade['type'] == 'sell':
+                opposite_direction = True
+            elif pending_signal.executed_signal == 'sell' and trade['type'] == 'buy':
+                opposite_direction = True
+
+            if opposite_direction:
+                trade['exit_time'] = entry_timestamp
+                trade['exit_price'] = entry_price
+                trade['exit_reason'] = 'opposite_signal'
+
+                if trade['type'] == 'buy':
+                    trade['pnl_points'] = trade['exit_price'] - trade['entry_price']
+                else:
+                    trade['pnl_points'] = trade['entry_price'] - trade['exit_price']
+
+                trade['pnl_points'] -= 0.155
+                trade['pnl_dollars'] = trade['pnl_points'] * POINTS_VALUE * CONTRACTS_PER_TRADE
+                trade['outcome'] = 'success' if trade['pnl_points'] > 0 else 'failure'
+
+                active_trades.remove(trade)
+                self.completed_trades.append(trade)
+                self.total_pnl_points += trade['pnl_points']
+
+                # Record the close
+                self.record_trade_close(trade)
+
+                logger.info(f"   ⚡ Trade closed by opposite signal @ {entry_price:.2f} "
+                          f"P&L: {trade['pnl_points']:.2f} pts (${trade['pnl_dollars']:,.2f})")
+
+                self.ml_trainer.add_completed_trade(trade)
+                positions_closed += 1
+
+        # Close opposite virtual positions
+        virtuals_closed = 0
+        for vp_id in list(self.virtual_positions.keys()):
+            vp = self.virtual_positions[vp_id]
+            if vp.is_active:
+                opposite_direction = False
+                if pending_signal.executed_signal == 'buy' and vp.direction == 'sell':
+                    opposite_direction = True
+                elif pending_signal.executed_signal == 'sell' and vp.direction == 'buy':
+                    opposite_direction = True
+
+                if opposite_direction:
+                    vp.exit_time = entry_timestamp
+                    vp.exit_price = entry_price
+                    vp.exit_reason = 'opposite_signal'
+                    vp.is_active = False
+
+                    if vp.direction == 'buy':
+                        vp.pnl = vp.exit_price - vp.entry_price
+                    else:
+                        vp.pnl = vp.entry_price - vp.exit_price
+
+                    vp.pnl -= 0.155
+                    self.record_virtual_outcome(vp)
+                    del self.virtual_positions[vp_id]
+                    virtuals_closed += 1
+
+        # Create new trade with news impact multipliers
+        tp_points, sl_points = self.get_best_params_for_context(pending_signal.segment_id, pending_signal.news_impact)
+        self.create_virtual_positions_for_signal(entry_price, pending_signal.executed_signal,
+                                               pending_signal.segment_id, pending_signal.news_impact, entry_timestamp)
+
+        self.trade_counter += 1
+        trade_id = f"NQ1_{self.trade_counter}_{int(entry_timestamp.timestamp())}"
+
+        news_events = get_economic_events_for_date(entry_timestamp.date())
+        news_info = None
+        if news_events:
+            news_info = [{'type': e['type'], 'time': e['time'], 'impact': e['impact']} for e in news_events]
+
+        new_trade = {
+            'trade_id': trade_id,
+            'symbol': 'NQ1!',
+            'type': pending_signal.executed_signal,
+            'entry_time': entry_timestamp,
+            'entry_price': float(entry_price),
+            'tp_price': float(entry_price + tp_points if pending_signal.executed_signal == 'buy' else entry_price - tp_points),
+            'sl_price': float(entry_price - sl_points if pending_signal.executed_signal == 'buy' else entry_price + sl_points),
+            'tp_points': float(tp_points),
+            'sl_points': float(sl_points),
+            'risk_ratio': float(tp_points / sl_points) if sl_points > 0 else 2.0,
+            'features': pending_signal.features,
+            'was_reversed': pending_signal.was_reversed,
+            'ml_confidence': float(pending_signal.ml_confidence),
+            'segment_id': pending_signal.segment_id,
+            'news_impact': pending_signal.news_impact,
+            'entry_bar_index': len(candles_up_to_now) - 1,
+            'outcome': None,
+            'exit_price': None,
+            'exit_time': None,
+            'exit_reason': None,
+            'pnl_points': None,
+            'pnl_dollars': None
+        }
+
+        active_trades.append(new_trade)
+        self.total_trades += 1
+
+        # Record the open
+        self.record_trade_open(new_trade, entry_timestamp)
+
+        logger.info(f"✅ Signal executed at {entry_timestamp.strftime('%Y-%m-%d %H:%M')}: "
+                  f"{pending_signal.signal} → {pending_signal.executed_signal} @ {entry_price:.2f}" +
+                  (f" (ML reversed)" if pending_signal.was_reversed else "") +
+                  f" | TP/SL: {tp_points}/{sl_points}")
+
+    def save_results_to_google_drive(self, drive_folder_id=None):
+        """Save all simulation results to Google Drive in production format"""
+        if not drive_folder_id:
+            drive_folder_id = GOOGLE_DRIVE_FOLDER_ID
+
+        exporter = ProductionReadyExporter(drive_folder_id)
+        exporter.save_simulation_results(self)
+
+    def get_results(self):
+        """Get simulation results with ML comparison metrics and daily profitability stats"""
+        comparison = self.performance_tracker.get_comparison_metrics()
+
+        # Calculate daily profitability statistics
+        daily_pnl_values = [v['pnl_dollars'] for v in self.daily_pnl.values() if v['trades_closed'] > 0]
+        profitable_days = [p for p in daily_pnl_values if p > 0]
+        losing_days = [p for p in daily_pnl_values if p < 0]
+
+        num_winning_days = len(profitable_days)
+        num_losing_days = len(losing_days)
+        total_trading_days = len(daily_pnl_values)
+
+        pct_profitable_days = (num_winning_days / total_trading_days * 100) if total_trading_days > 0 else 0
+        avg_trade_per_day = len(self.completed_trades) / total_trading_days if total_trading_days > 0 else 0
+        avg_winning_day = np.mean(profitable_days) if profitable_days else 0
+        avg_losing_day = np.mean(losing_days) if losing_days else 0
+
+        results = {
+            'total_signals': self.total_signals,
+            'total_trades': len(self.completed_trades),
+            'total_reversals': self.total_reversals,
+            'total_pnl_points': self.total_pnl_points,
+            'total_pnl_dollars': self.total_pnl_points * POINTS_VALUE * CONTRACTS_PER_TRADE,
+            'ml_accuracy': 0,
+            'win_rate': 0,
+            'optimized_params': len(self.best_params_2d),
+            'completed_trades': self.completed_trades,
+            'bars_processed': self.bars_processed,
+            'ny_session_bars': self.ny_session_bars,
+            'daily_pnl': dict(self.daily_pnl),
+            'monthly_pnl': dict(self.monthly_pnl),
+
+            # ENHANCED: Daily profitability metrics
+            'daily_profitability': {
+                'total_trading_days': total_trading_days,
+                'winning_days': num_winning_days,
+                'losing_days': num_losing_days,
+                'pct_profitable_days': pct_profitable_days,
+                'avg_trades_per_day': avg_trade_per_day,
+                'avg_winning_day': avg_winning_day,
+                'avg_losing_day': avg_losing_day,
+                'best_day': max(profitable_days) if profitable_days else 0,
+                'worst_day': min(losing_days) if losing_days else 0
+            },
+
+            # ENHANCED: ML vs Original comparison
+            'ml_comparison': comparison
+        }
+
+        if self.completed_trades:
+            wins = sum(1 for t in self.completed_trades if t['outcome'] == 'success')
+            results['win_rate'] = wins / len(self.completed_trades)
+
+            # ML accuracy
+            ml_correct = sum(1 for t in self.completed_trades
+                           if t.get('was_reversed') and t['outcome'] == 'success')
+            ml_trades = sum(1 for t in self.completed_trades if t.get('was_reversed'))
+            if ml_trades > 0:
+                results['ml_accuracy'] = ml_correct / ml_trades
+
+        return results
+
+
+# === GOOGLE DRIVE INTEGRATION ===
+class ProductionReadyExporter:
+    """Save all artifacts to Google Drive in production format"""
+
+    def __init__(self, folder_id):
+        self.folder_id = folder_id
+        self.drive_service = self.authenticate_drive()
+
+    def authenticate_drive(self):
+        """Authenticate with Google Drive"""
+        try:
+            creds = None
+
+            if os.path.exists('token.json'):
+                creds = Credentials.from_authorized_user_file('token.json', GOOGLE_SCOPES)
+
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        'credentials.json', GOOGLE_SCOPES)
+                    creds = flow.run_local_server(port=0)
+
+                with open('token.json', 'w') as token:
+                    token.write(creds.to_json())
+
+            service = build('drive', 'v3', credentials=creds)
+            logger.info("✅ Connected to Google Drive")
+            return service
+
+        except Exception as e:
+            logger.error(f"❌ Google Drive authentication failed: {e}")
+            return None
+
+    def save_file(self, filename, content):
+        """Save a file to Google Drive"""
+        if not self.drive_service:
+            return
+
+        try:
+            media = MediaInMemoryUpload(content, mimetype='application/octet-stream')
+
+            file_metadata = {
+                'name': filename,
+                'parents': [self.folder_id]
+            }
+
+            query = f"name = '{filename}' and '{self.folder_id}' in parents and trashed = false"
+            results = self.drive_service.files().list(q=query, fields="files(id)").execute()
+            existing_files = results.get('files', [])
+
+            if existing_files:
+                file_id = existing_files[0]['id']
+                self.drive_service.files().update(fileId=file_id, media_body=media).execute()
+                logger.info(f"✅ Updated {filename}")
+            else:
+                self.drive_service.files().create(body=file_metadata, media_body=media).execute()
+                logger.info(f"✅ Created {filename}")
+
+        except Exception as e:
+            logger.error(f"Error saving {filename}: {e}")
+
+    def save_simulation_results(self, simulator):
+        """Save everything needed for live trading in production format"""
+        # 1. Trained ML model
+        if simulator.ml_trainer.model:
+            model_data = {
+                'model': simulator.ml_trainer.model,
+                'scaler': simulator.ml_trainer.scaler,
+                'feature_columns': simulator.ml_trainer.feature_columns,
+                'confidence_threshold': simulator.ml_trainer.confidence_threshold,
+                'training_data_count': len(simulator.ml_trainer.training_data)
+            }
+            self.save_file('NQ1_model_latest.pkl', pickle.dumps(model_data))
+
+        # 2. Trade history - organized by date
+        trades_by_date = defaultdict(list)
+        for trade in simulator.completed_trades:
+            date_str = trade['entry_time'].strftime('%Y%m%d')
+
+            trade_json = trade.copy()
+            trade_json['entry_time'] = trade['entry_time'].isoformat()
+            if trade.get('exit_time'):
+                trade_json['exit_time'] = trade['exit_time'].isoformat()
+
+            trades_by_date[date_str].append(trade_json)
+
+        for date_str, trades in trades_by_date.items():
+            filename = f'NQ1_trade_outcomes_{date_str}.json'
+            self.save_file(filename, json.dumps(trades, indent=2).encode())
+
+        # 3. Virtual optimization data
+        grid_performance_data = {}
+        for segment_id in simulator.segment_performance_2d:
+            if segment_id in TIME_SEGMENTS:
+                grid_performance_data[segment_id] = {}
+                for news_impact in simulator.segment_performance_2d[segment_id]:
+                    if news_impact in NEWS_IMPACT_LEVELS:
+                        grid_performance_data[segment_id][news_impact] = {}
+                        for cell_key, stats in simulator.segment_performance_2d[segment_id][news_impact].items():
+                            grid_performance_data[segment_id][news_impact][cell_key] = dict(stats)
+
+        optimization_data = {
+            'grid_performance_2d': grid_performance_data,
+            'best_params_2d': simulator.best_params_2d,
+            'grid_type': '2D',
+            'exploration_rate': 0.05,
+            'total_virtual_created': len(simulator.virtual_positions),
+            'total_virtual_closed': sum(1 for vp in simulator.virtual_positions.values() if not vp.is_active),
+            'dimensions': {
+                'segments': list(TIME_SEGMENTS.keys()),
+                'news_impacts': list(NEWS_IMPACT_LEVELS.keys())
+            },
+            'last_update': datetime.now().isoformat()
+        }
+
+        self.save_file('NQ1_virtual_optimization_2D.json',
+                      json.dumps(optimization_data, indent=2, default=str).encode())
+
+        # 4. ML Comparison Results
+        comparison_data = simulator.performance_tracker.get_comparison_metrics()
+        self.save_file('NQ1_ml_comparison_results.json',
+                      json.dumps(comparison_data, indent=2, default=str).encode())
+
+        # 5. Daily Profitability Statistics
+        daily_stats = simulator.get_results()['daily_profitability']
+        self.save_file('NQ1_daily_profitability_stats.json',
+                      json.dumps(daily_stats, indent=2, default=str).encode())
+
+        # 6. Metadata
+        metadata = {
+            'simulation_start': simulator.start_date.isoformat(),
+            'simulation_end': simulator.end_date.isoformat(),
+            'symbol': simulator.symbol,
+            'contracts_per_trade': CONTRACTS_PER_TRADE,
+            'total_signals': simulator.total_signals,
+            'total_trades': len(simulator.completed_trades),
+            'total_reversals': simulator.total_reversals,
+            'total_pnl_points': simulator.total_pnl_points,
+            'total_pnl_dollars': simulator.total_pnl_points * POINTS_VALUE * CONTRACTS_PER_TRADE,
+            'model_trained': simulator.ml_trainer.model is not None,
+            'optimized_params': len(simulator.best_params_2d),
+            'ready_for_production': True,
+            'last_update': datetime.now().isoformat(),
+            'entry_timing_fix': 'Applied - signals detected at bar close, entries on next bar open',
+            'exit_timing_fix': 'Applied - no look-ahead bias, chronological exit checking',
+            'session_end_fix': 'Applied - force close all trades at NY session end (4:30 PM ET)',
+            'ml_comparison': comparison_data,
+            'daily_profitability': daily_stats
+        }
+        self.save_file('simulation_metadata.json', json.dumps(metadata, indent=2).encode())
+
+        logger.info("✅ All simulation results saved to Google Drive")
+
+
+# === MAIN EXECUTION ===
+def run_complete_backtest():
+    """Full historical simulation with FIXED chronological exit checking and session-end closure"""
+
+    # Initialize simulator
+    simulator = HistoricalTradingSimulator(
+        start_date='2024-10-01',
+        end_date='2026-01-25',
+        symbol='NQ'
+    )
+
+    # Load aligned data - this will now initialize the optimized tick processor
+    logger.info("Loading historical data with optimized tick processor...")
+    simulator.load_aligned_data()
+
+    # Run simulation with FIXED chronological exit checking and session-end closure
+    logger.info("Running simulation with CHRONOLOGICAL exit checking and session-end closure...")
+    results = simulator.run_simulation()
+
+    # Print results
+    logger.info("=" * 60)
+    logger.info("SIMULATION RESULTS")
+    logger.info("=" * 60)
+    logger.info(f"Total Signals: {results['total_signals']}")
+    logger.info(f"Total Trades: {results['total_trades']}")
+    logger.info(f"Position Size: {CONTRACTS_PER_TRADE} contracts")
+    logger.info(f"Total P&L: {results['total_pnl_points']:.2f} points (${results['total_pnl_dollars']:,.2f})")
+    logger.info(f"Win Rate: {results['win_rate']:.1%}")
+    logger.info(f"ML Accuracy: {results['ml_accuracy']:.1%}")
+    logger.info(f"Total Reversals: {results['total_reversals']}")
+    logger.info(f"Optimized Parameter Sets: {results['optimized_params']}")
+    logger.info(f"Bars Processed: {results['bars_processed']}")
+    logger.info(f"NY Session Bars: {results['ny_session_bars']}")
+
+    # Daily profitability stats
+    daily_prof = results['daily_profitability']
+    logger.info("\nDAILY PROFITABILITY METRICS:")
+    logger.info(f"Total Trading Days: {daily_prof['total_trading_days']}")
+    logger.info(f"Winning Days: {daily_prof['winning_days']}")
+    logger.info(f"Losing Days: {daily_prof['losing_days']}")
+    logger.info(f"Percentage Profitable Days: {daily_prof['pct_profitable_days']:.1f}%")
+    logger.info(f"Avg Trades Per Day: {daily_prof['avg_trades_per_day']:.1f}")
+    logger.info(f"Avg Winning Day: ${daily_prof['avg_winning_day']:,.2f}")
+    logger.info(f"Avg Losing Day: ${daily_prof['avg_losing_day']:,.2f}")
+    logger.info(f"Best Day: ${daily_prof['best_day']:,.2f}")
+    logger.info(f"Worst Day: ${daily_prof['worst_day']:,.2f}")
+
+    logger.info("\nFIXED: No look-ahead bias - trades exit chronologically")
+    logger.info("ENHANCED: ML vs Original Strategy Performance Comparison")
+    logger.info("FIXED: Force close all trades at NY session end (4:30 PM ET)")
+
+    # Print ML comparison summary
+    comparison = results['ml_comparison']
+    ml_impact = comparison['ml_impact']
+    logger.info(f"\nML Impact: {ml_impact['pnl_improvement']:.2f} pts improvement ({ml_impact['pnl_improvement_pct']:.1f}%)")
+    logger.info(f"ML P&L Impact: ${ml_impact['pnl_improvement'] * POINTS_VALUE * CONTRACTS_PER_TRADE:,.2f}")
+    logger.info("=" * 60)
+
+    # Save to Google Drive (optional - uncomment if you have credentials)
+    #simulator.save_results_to_google_drive()
+
+    return simulator, results
+
+
+if __name__ == "__main__":
+    # Run the backtest with FIXED chronological exit checking and session-end closure
+    simulator, results = run_complete_backtest()
