@@ -1,0 +1,753 @@
+//@version=5
+indicator("Gold 24/7 Regime Strategy", shorttitle="Gold Regime", overlay=true, max_lines_count=20)
+
+// =============================================================================
+// Inputs
+// =============================================================================
+
+G_ADAPTIVE = "Adaptive Regime"
+enable_adaptive_mode       = input.bool(true, "Enable trend/range detection", group=G_ADAPTIVE)
+trend_confidence_threshold = input.int(20, "Trend confidence threshold", minval=0, maxval=100, group=G_ADAPTIVE, tooltip="Minimum confidence to activate the trend regime")
+range_confidence_threshold = input.int(40, "Range confidence threshold", minval=0, maxval=100, group=G_ADAPTIVE, tooltip="Minimum confidence to activate the range regime")
+block_100_percent_range    = input.bool(true, "Block trades at 100% range confidence", group=G_ADAPTIVE)
+
+G_SESSION = "Session"
+enable_24h_trading = input.bool(true, "Trade 24/7", group=G_SESSION)
+session_time       = input.session("0000-2359", "Session (when 24/7 is off)", group=G_SESSION)
+range_minutes      = input.int(15, "Opening range minutes", minval=5, maxval=60, group=G_SESSION)
+
+G_OPEN = "Open Hour (9-10 AM ET)"
+enable_open_hour_protection   = input.bool(true, "Enable open hour protection", group=G_OPEN)
+min_strength_open_hour        = input.int(65, "Min signal strength", minval=50, maxval=100, group=G_OPEN)
+volume_spike_boost            = input.float(0.3, "Extra volume spike multiplier", minval=0.1, maxval=1.0, step=0.1, group=G_OPEN)
+force_trend_at_open           = input.bool(true, "Force trend filter", group=G_OPEN)
+block_gap_fills_at_open       = input.bool(true, "Block gap fills", group=G_OPEN)
+require_confirmation_breakout = input.bool(true, "Breakout candle must close in trade direction", group=G_OPEN)
+
+G_NO_TRADE = "No-Trade Window (ET)"
+enable_no_trade_window = input.bool(true, "Enable no-trade window", group=G_NO_TRADE)
+no_trade_start_str     = input.string("1500", "Start (HHMM)", group=G_NO_TRADE)
+no_trade_end_str       = input.string("1700", "End (HHMM)", group=G_NO_TRADE)
+
+G_CONFIRM = "Bar Confirmation"
+clean_candles_required = input.int(2, "Clean candles required", minval=1, maxval=10, group=G_CONFIRM, tooltip="Bars without a signal required before a new entry")
+manual_position_closed = input.bool(false, "Manual: position is closed", group=G_CONFIRM, tooltip="Turn on when your broker position has closed to override confirmation")
+allow_overlapping_wins = input.bool(true, "Skip confirmation after a win", group=G_CONFIRM)
+
+G_REGIME = "Regime Inputs"
+adx_period               = input.int(14, "ADX period", minval=5, group=G_REGIME)
+adx_trend_threshold      = input.int(25, "ADX trend threshold", minval=15, group=G_REGIME)
+bb_expansion_threshold   = input.float(1.5, "BB expansion threshold", minval=1.0, step=0.1, group=G_REGIME)
+vwap_distance_threshold  = input.float(0.5, "VWAP distance threshold (%)", minval=0.1, step=0.1, group=G_REGIME)
+ema_separation_threshold = input.float(0.25, "EMA separation threshold (%)", minval=0.1, step=0.1, group=G_REGIME)
+volatility_lookback      = input.int(20, "Volatility lookback", minval=5, maxval=50, group=G_REGIME)
+high_vol_threshold       = input.float(1.5, "High volatility threshold", minval=1.0, maxval=3.0, step=0.1, group=G_REGIME)
+
+G_CHOP = "Choppiness Filter"
+use_chop_filter = input.bool(true, "Use choppiness filter", group=G_CHOP)
+chop_threshold  = input.int(60, "Choppiness threshold (0-120)", minval=0, maxval=120, group=G_CHOP)
+chop_length     = input.int(14, "Choppiness index length", minval=1, group=G_CHOP)
+er_length       = input.int(10, "Efficiency ratio length", minval=1, group=G_CHOP)
+
+G_IND = "Indicators"
+use_ema            = input.bool(true, "Show 21 EMA", group=G_IND)
+use_vwap           = input.bool(true, "Show VWAP", group=G_IND)
+use_momentum       = input.bool(true, "Use momentum signals", group=G_IND)
+use_trend_filter   = input.bool(false, "Use trend filter (EMA21 vs EMA50)", group=G_IND)
+use_rsi_divergence = input.bool(true, "Use RSI divergence check", group=G_IND)
+rsi_period         = input.int(14, "RSI period", minval=2, group=G_IND)
+
+G_FILTER = "Filters"
+use_volume_spike          = input.bool(true, "Require volume spike", group=G_FILTER)
+volume_spike_multiplier   = input.float(1.8, "Volume spike multiplier", minval=1.2, maxval=3.0, step=0.1, group=G_FILTER)
+use_candle_structure      = input.bool(true, "Require strong candle close", group=G_FILTER)
+require_vwap_confirmation = input.bool(true, "Require VWAP confirmation for gap fills", group=G_FILTER)
+min_signal_strength       = input.int(60, "Minimum signal strength", minval=30, maxval=100, group=G_FILTER)
+
+G_RISK = "Risk"
+profit_target_ratio = input.float(2.0, "Reward:risk", minval=1.0, maxval=5.0, step=0.1, group=G_RISK)
+use_smoothed_atr    = input.bool(true, "Smooth ATR", group=G_RISK)
+min_stop_size       = input.float(8.0, "Minimum stop (points)", minval=2.0, maxval=20.0, step=0.5, group=G_RISK)
+atr_period          = input.int(14, "ATR period", minval=1, group=G_RISK)
+enable_short        = input.bool(true, "Allow shorts", group=G_RISK)
+
+G_VISUAL = "Display"
+show_range       = input.bool(true, "Opening range", group=G_VISUAL)
+show_signals     = input.bool(true, "Signals", group=G_VISUAL)
+show_levels      = input.bool(true, "Stop / target levels", group=G_VISUAL)
+show_regime_info = input.bool(true, "Regime info", group=G_VISUAL)
+
+G_ALERT = "Morning Alert"
+enable_6am_alert = input.bool(true, "Enable morning market check", group=G_ALERT)
+alert_time       = input.string("0600", "Time (HHMM, ET)", group=G_ALERT)
+
+// =============================================================================
+// Core series
+// =============================================================================
+
+ema21 = ta.ema(close, 21)
+ema50 = ta.ema(close, 50)
+rsi   = ta.rsi(close, rsi_period)
+
+raw_atr      = ta.atr(atr_period)
+smoothed_atr = use_smoothed_atr ? ta.ema(raw_atr, 10) : raw_atr
+atr          = math.max(smoothed_atr, min_stop_size)
+
+volume_sma      = ta.sma(volume, 20)
+volume_strength = volume / volume_sma
+
+// =============================================================================
+// Time & session
+// =============================================================================
+
+TZ = "America/New_York"
+hour_ny    = hour(time, TZ)
+time_ny    = hour_ny * 100 + minute(time, TZ)   // HHMM as an int
+is_new_day = ta.change(dayofweek) != 0
+
+is_open_hour = enable_open_hour_protection and hour_ny == 9
+
+no_trade_window_text = no_trade_start_str + "-" + no_trade_end_str + " ET"
+in_no_trade_period   = enable_no_trade_window and time_ny >= str.tonumber(no_trade_start_str) and time_ny < str.tonumber(no_trade_end_str)
+
+in_session = (enable_24h_trading or not na(time(timeframe.period, session_time))) and not in_no_trade_period
+
+session_info = hour_ny < 6 ? "OVERNIGHT" : hour_ny < 10 ? "MORNING" : hour_ny < 14 ? "LUNCH" : hour_ny < 18 ? "AFTERNOON" : "OVERNIGHT"
+session_favors_trend = (hour_ny >= 9 and hour_ny < 11) or (hour_ny >= 14 and hour_ny < 16)
+session_favors_range = (hour_ny >= 11 and hour_ny < 14) or hour_ny >= 18 or hour_ny < 6
+
+// Daily VWAP, reset at the start of each day.
+var float cum_pv  = 0.0
+var float cum_vol = 0.0
+if is_new_day
+    cum_pv  := 0.0
+    cum_vol := 0.0
+cum_pv  += hlc3 * volume
+cum_vol += volume
+vwap_value = cum_vol > 0 ? cum_pv / cum_vol : close
+
+// Opening range: high/low of the first `range_minutes` of the session.
+var float range_high        = na
+var float range_low         = na
+var int   range_start_bar   = na
+var bool  range_established = false
+
+if is_new_day
+    range_high        := na
+    range_low         := na
+    range_start_bar   := na
+    range_established := false
+
+if in_session and not range_established
+    if na(range_start_bar)
+        range_start_bar := bar_index
+        range_high      := high
+        range_low       := low
+    else if (bar_index - range_start_bar) * timeframe.in_seconds() <= range_minutes * 60
+        range_high := math.max(range_high, high)
+        range_low  := math.min(range_low, low)
+    else
+        range_established := true
+
+// Overnight gap, only non-zero on the first bar of the day.
+// TODO: this compares against close[2]; the prior close (close[1]) was probably intended.
+gap_size   = is_new_day and not na(close[2]) ? open - close[2] : 0.0
+prev_close = close[1]
+
+// =============================================================================
+// Regime detection
+// =============================================================================
+
+// Volatility
+current_volatility = ta.stdev(ta.change(close), volatility_lookback)
+volatility_ratio   = current_volatility / ta.sma(current_volatility, volatility_lookback)
+high_vol_regime    = volatility_ratio > high_vol_threshold
+low_vol_regime     = volatility_ratio < 1.0 / high_vol_threshold
+
+[bb_basis, bb_upper, bb_lower] = ta.bb(close, 20, 2.0)
+bb_width      = (bb_upper - bb_lower) / bb_basis * 100
+bb_expanding  = bb_width > ta.sma(bb_width, 20) * bb_expansion_threshold
+atr_rising    = (atr - atr[3]) / atr[3] * 100 > 5
+vol_expansion = bb_expanding and atr_rising
+
+// Trend strength
+[di_plus, di_minus, adx] = ta.dmi(adx_period, adx_period)
+ema_separation = math.abs(ema21 - ema50) / close * 100
+vwap_distance  = math.abs(close - vwap_value) / close * 100
+near_vwap      = vwap_distance < vwap_distance_threshold
+strong_trend   = adx > adx_trend_threshold and ema_separation > ema_separation_threshold
+
+// Price structure
+recent_high = ta.highest(high, 10)
+recent_low  = ta.lowest(low, 10)
+uptrend_structure   = (high > recent_high[1] and high == recent_high) or (low > recent_low[1] and low == recent_low)
+downtrend_structure = (high < recent_high[1] and high == recent_high) or (low < recent_low[1] and low == recent_low)
+trending_structure  = uptrend_structure or downtrend_structure
+
+swing_high = ta.highest(high, 20)
+swing_low  = ta.lowest(low, 20)
+failed_breakout   = (high > swing_high[1] and close < swing_high[1]) or (low < swing_low[1] and close > swing_low[1])
+ranging_structure = failed_breakout or near_vwap
+
+// Choppiness: choppiness index + ADX + efficiency ratio, each scored 0-40.
+chop        = 100 * math.log10(math.sum(ta.tr, chop_length) / (ta.highest(high, chop_length) - ta.lowest(low, chop_length))) / math.log10(chop_length)
+path_length = math.sum(math.abs(close - close[1]), er_length)
+er          = path_length > 0 ? math.abs(close - close[er_length]) / path_length : 0
+
+chop_adjustment = high_vol_regime ? -10 : low_vol_regime ? 10 : 0
+adjusted(base) => math.max(0, base + chop_adjustment)
+
+chop_pts = adjusted(chop > 61.8 ? 40 : chop < 38.2 ? 0 : 20)
+adx_pts  = adjusted(adx < 20 ? 40 : adx < 30 ? 20 : 0)
+er_pts   = adjusted(er < 0.2 ? 40 : er < 0.4 ? 20 : 0)
+
+total_chop_score = chop_pts + adx_pts + er_pts
+choppiness_level = total_chop_score >= 80 ? "HIGHLY CHOPPY" : total_chop_score >= 40 ? "MEDIUM CHOPPY" : "LOW CHOPPY"
+is_choppy_market = use_chop_filter and total_chop_score >= chop_threshold
+
+// Regime scoring. Each factor awards points to either trend or range.
+volume_spike = volume > volume_sma * volume_spike_multiplier
+
+vol_trend_pts      = vol_expansion ? 25 : 0
+vol_range_pts      = vol_expansion ? 0 : 15
+strength_trend_pts = strong_trend ? 30 : 0
+strength_range_pts = strong_trend ? 0 : 20
+struct_trend_pts   = trending_structure ? 20 : 0
+struct_range_pts   = not trending_structure and ranging_structure ? 25 : 0
+session_trend_pts  = session_favors_trend ? 15 : 0
+session_range_pts  = not session_favors_trend and session_favors_range ? 20 : 0
+vwap_range_pts     = near_vwap ? 15 : 0
+volume_trend_pts   = volume_spike and trending_structure ? 10 : 0
+volume_range_pts   = volume_spike and not trending_structure and ranging_structure ? 5 : 0
+
+trend_score = vol_trend_pts + strength_trend_pts + struct_trend_pts + session_trend_pts + volume_trend_pts
+range_score = vol_range_pts + strength_range_pts + struct_range_pts + session_range_pts + vwap_range_pts + volume_range_pts
+
+score_sum        = trend_score + range_score
+trend_confidence = enable_adaptive_mode and score_sum > 0 ? trend_score / score_sum * 100 : 0
+range_confidence = enable_adaptive_mode and score_sum > 0 ? range_score / score_sum * 100 : 0
+
+// If both regimes clear their threshold, the higher confidence wins.
+trend_ok = enable_adaptive_mode and trend_confidence >= trend_confidence_threshold
+range_ok = enable_adaptive_mode and range_confidence >= range_confidence_threshold
+is_trend_regime = trend_ok and (not range_ok or trend_confidence > range_confidence)
+is_range_regime = range_ok and (not trend_ok or trend_confidence <= range_confidence)
+
+regime_confidence = math.max(trend_confidence, range_confidence)
+regime_type = is_trend_regime ? "TREND" : is_range_regime ? "RANGE" : "UNCERTAIN"
+regime_subtype = if is_trend_regime
+    uptrend_structure and ema21 > ema50 ? "UPTREND" : downtrend_structure and ema21 < ema50 ? "DOWNTREND" : "TREND FORMING"
+else if is_range_regime
+    near_vwap and not vol_expansion ? "TIGHT RANGE" : ranging_structure ? "WIDE RANGE" : "MEAN REVERT"
+else
+    trend_confidence < trend_confidence_threshold and range_confidence < range_confidence_threshold ? "LOW CONFIDENCE" : "THRESHOLD NOT MET"
+
+is_100_percent_range = block_100_percent_range and range_confidence >= 99.0
+
+// =============================================================================
+// Signals
+// =============================================================================
+
+force_trend   = use_trend_filter or (force_trend_at_open and is_open_hour)
+bullish_trend = not force_trend or (ema21 > ema50 and close > ema21)
+bearish_trend = not force_trend or (ema21 < ema50 and close < ema21)
+
+// Divergence over 5 bars, confirmed bars only.
+rsi_div_bull = use_rsi_divergence and barstate.isconfirmed and close < close[5] and rsi > rsi[5]
+rsi_div_bear = use_rsi_divergence and barstate.isconfirmed and close > close[5] and rsi < rsi[5]
+
+volume_mult = is_open_hour ? volume_spike_multiplier + volume_spike_boost : volume_spike_multiplier
+volume_ok   = use_volume_spike ? volume > volume_sma * volume_mult : volume > volume_sma
+
+bar_range         = high - low
+strong_bull_close = not use_candle_structure or close > high - bar_range * 0.25
+strong_bear_close = not use_candle_structure or close < low + bar_range * 0.25
+
+bull_momentum = use_momentum and bullish_trend and close > ema21 and close > vwap_value and rsi > 50 and rsi < 70 and volume_ok and strong_bull_close and not rsi_div_bear
+bear_momentum = use_momentum and enable_short and bearish_trend and close < ema21 and close < vwap_value and rsi < 50 and rsi > 30 and volume_ok and strong_bear_close and not rsi_div_bull
+
+need_breakout_candle = require_confirmation_breakout and is_open_hour
+bull_breakout = bullish_trend and not na(range_high) and close > range_high and volume_ok and strong_bull_close and (not need_breakout_candle or close > open)
+bear_breakout = enable_short and bearish_trend and not na(range_low) and close < range_low and volume_ok and strong_bear_close and (not need_breakout_candle or close < open)
+
+gap_fills_allowed = not (block_gap_fills_at_open and is_open_hour)
+gap_fill_bull = gap_size < 0 and low <= prev_close and bullish_trend and (not require_vwap_confirmation or close > vwap_value) and gap_fills_allowed
+gap_fill_bear = gap_size > 0 and high >= prev_close and bearish_trend and enable_short and (not require_vwap_confirmation or close < vwap_value) and gap_fills_allowed
+
+raw_long_signal  = bull_breakout or bull_momentum or gap_fill_bull
+raw_short_signal = bear_breakout or bear_momentum or gap_fill_bear
+long_signal      = raw_long_signal and not is_100_percent_range
+short_signal     = raw_short_signal and not is_100_percent_range
+
+// Signal strength, 0-100.
+signal_strength_score(bool is_long) =>
+    volume_pts = volume_strength > 3.0 ? 35 : volume_strength > 2.0 ? 30 : volume_strength > 1.5 ? 20 : 10
+
+    rsi_dist = math.abs(rsi - 50)
+    rsi_pts  = rsi_dist > 25 ? 30 : rsi_dist > 20 ? 25 : rsi_dist > 15 ? 20 : rsi_dist > 10 ? 15 : 10
+
+    dist_pct     = (math.abs(close - vwap_value) + math.abs(close - ema21)) / close * 100
+    distance_pts = dist_pct > 2.0 ? 25 : dist_pct > 1.0 ? 20 : 15
+
+    session_pts = session_favors_trend ? 10 : 0
+
+    type_pts = if bull_breakout or bear_breakout
+        breakout_atr = math.abs(close - (is_long ? range_high : range_low)) / atr
+        breakout_atr > 0.75 ? 25 : breakout_atr > 0.5 ? 20 : 15
+    else if bull_momentum or bear_momentum
+        20
+    else if gap_fill_bull or gap_fill_bear
+        gap = math.abs(gap_size)
+        gap > atr * 2 ? 15 : gap > atr ? 10 : 5
+    else
+        0
+
+    divergence_pts = (is_long ? rsi_div_bull : rsi_div_bear) ? 10 : 0
+    vol_regime_pts = high_vol_regime ? 5 : low_vol_regime ? -5 : 0
+
+    total = volume_pts + rsi_pts + distance_pts + session_pts + type_pts + divergence_pts + vol_regime_pts
+    math.min(100, math.max(0, total))
+
+float signal_strength = long_signal or short_signal ? signal_strength_score(long_signal) : 0.0
+
+open_hour_strength_ok = not is_open_hour or signal_strength >= min_strength_open_hour
+entry_filters_ok      = in_session and range_established and not is_choppy_market and open_hour_strength_ok and signal_strength >= min_signal_strength
+
+long_entry         = long_signal and entry_filters_ok
+short_entry        = short_signal and entry_filters_ok
+any_signal_present = long_entry or short_entry
+
+// =============================================================================
+// Bar confirmation
+// =============================================================================
+
+var float  entry_price          = na
+var float  stop_loss            = na
+var float  take_profit          = na
+var float  entry_strength       = na
+var string position_type        = na
+var bool   in_position          = false
+var bool   last_position_closed = true
+var string last_trade_type      = na
+var bool   last_trade_was_win   = false
+var float  last_trade_pnl       = 0.0
+
+signal_blocked_by_no_trade  = any_signal_present and in_no_trade_period
+signal_blocked_by_open_hour = any_signal_present and not open_hour_strength_ok
+signal_blocked_by_range_100 = any_signal_present and is_100_percent_range
+blocked_now   = signal_blocked_by_no_trade or signal_blocked_by_open_hour or signal_blocked_by_range_100
+long_blocked  = blocked_now and raw_long_signal[1]
+short_blocked = blocked_now and raw_short_signal[1]
+
+// Number of consecutive prior bars with no entry or blocked signal, looking back
+// up to `clean_candles_required` bars. History does not reach past the last bar
+// of the previous day.
+bars_into_day = nz(ta.barssince(is_new_day), 1000000)
+
+clean_streak(series bool entries, series bool blocked) =>
+    streak = 0
+    for k = 1 to clean_candles_required
+        if bars_into_day >= k - 1 and (entries[k] or blocked[k - 1])
+            break
+        streak += 1
+    streak
+
+long_clean_streak  = clean_streak(long_entry, long_blocked)
+short_clean_streak = clean_streak(short_entry, short_blocked)
+long_is_clean      = long_clean_streak >= clean_candles_required
+short_is_clean     = short_clean_streak >= clean_candles_required
+win_override       = allow_overlapping_wins and last_trade_was_win
+
+can_enter       = in_session and not in_no_trade_period and not in_position and (last_position_closed or manual_position_closed)
+can_enter_long  = can_enter and (long_is_clean or win_override)
+can_enter_short = can_enter and (short_is_clean or win_override)
+
+clear_of_other_filters = any_signal_present and not is_choppy_market
+signal_blocked_by_no_trade_only   = clear_of_other_filters and in_no_trade_period and open_hour_strength_ok and not signal_blocked_by_range_100
+signal_blocked_by_open_hour_only  = clear_of_other_filters and not in_no_trade_period and not open_hour_strength_ok and not signal_blocked_by_range_100
+signal_blocked_by_range_100_only  = clear_of_other_filters and not in_no_trade_period and open_hour_strength_ok and signal_blocked_by_range_100
+signal_blocked_by_bar_confirmation = clear_of_other_filters and not in_no_trade_period and open_hour_strength_ok and not signal_blocked_by_range_100 and not can_enter_long and not can_enter_short
+
+long_entry_confirmed  = long_entry and can_enter_long
+short_entry_confirmed = short_entry and can_enter_short
+entered               = long_entry_confirmed or short_entry_confirmed
+
+// =============================================================================
+// Position management
+// =============================================================================
+
+var line sl_line = na
+var line tp_line = na
+
+if entered
+    // If both sides fire on the same bar, the short takes precedence.
+    dir           = short_entry_confirmed ? -1 : 1
+    strength_mult = 1.0 + (signal_strength / 100) * 0.6
+    regime_mult   = high_vol_regime ? 1.2 : low_vol_regime ? 0.8 : 1.0
+    target_dist   = atr * profit_target_ratio * (strength_mult * regime_mult)
+
+    entry_price          := close
+    stop_loss            := close - dir * atr
+    take_profit          := close + dir * target_dist
+    entry_strength       := signal_strength
+    position_type        := dir == 1 ? "LONG" : "SHORT"
+    last_trade_type      := position_type
+    in_position          := true
+    last_position_closed := false
+
+    if show_levels
+        sl_line := line.new(bar_index, stop_loss, bar_index + 5, stop_loss, color=color.red, width=2)
+        tp_line := line.new(bar_index, take_profit, bar_index + 5, take_profit, color=color.green, width=2)
+
+long_stop_hit    = position_type == "LONG" and low <= stop_loss
+long_target_hit  = position_type == "LONG" and high >= take_profit
+short_stop_hit   = position_type == "SHORT" and high >= stop_loss
+short_target_hit = position_type == "SHORT" and low <= take_profit
+exited           = in_position and (long_stop_hit or long_target_hit or short_stop_hit or short_target_hit)
+
+if show_levels and in_position and not na(sl_line)
+    line.set_x2(sl_line, bar_index + 5)
+    line.set_x2(tp_line, bar_index + 5)
+
+if exited
+    // If stop and target are both touched on one bar, the target is assumed.
+    is_long    = position_type == "LONG"
+    target_hit = is_long ? long_target_hit : short_target_hit
+    exit_price = target_hit ? take_profit : stop_loss
+
+    last_trade_pnl       := is_long ? exit_price - entry_price : entry_price - exit_price
+    last_trade_was_win   := target_hit
+    in_position          := false
+    entry_price          := na
+    stop_loss            := na
+    take_profit          := na
+    position_type        := na
+    last_position_closed := true
+
+// =============================================================================
+// Morning alert
+// =============================================================================
+
+var bool alert_sent_today = false
+if is_new_day
+    alert_sent_today := false
+
+market_good_for_trading = not is_choppy_market and not in_no_trade_period and not is_100_percent_range
+alert_6am_condition     = enable_6am_alert and time_ny == str.tonumber(alert_time) and not alert_sent_today and market_good_for_trading
+
+if alert_6am_condition
+    alert_sent_today := true
+
+// =============================================================================
+// Plots & backgrounds
+// =============================================================================
+
+plot(use_ema ? ema21 : na, "EMA 21", color=color.blue, linewidth=2)
+plot(force_trend ? ema50 : na, "EMA 50", color=color.orange, linewidth=2)
+plot(use_vwap ? vwap_value : na, "VWAP", color=color.purple, linewidth=2)
+
+rsi_color = rsi_div_bull or rsi_div_bear ? color.orange : color.purple
+plot(rsi, "RSI", color=rsi_color, linewidth=2)
+hline(70, "RSI Overbought", color=color.red, linestyle=hline.style_dashed)
+hline(30, "RSI Oversold", color=color.green, linestyle=hline.style_dashed)
+hline(50, "RSI Midline", color=color.gray, linestyle=hline.style_solid)
+
+regime_bg = not (show_regime_info and enable_adaptive_mode) ? na : is_trend_regime ? color.new(color.blue, 95) : is_range_regime ? color.new(color.orange, 95) : na
+bgcolor(regime_bg, title="Regime")
+bgcolor(is_100_percent_range ? color.new(color.red, 90) : na, title="100% Range Block")
+bgcolor(is_open_hour ? color.new(color.blue, 93) : na, title="Open Hour Protection")
+bgcolor(in_no_trade_period ? color.new(color.orange, 93) : na, title="No-Trade Window")
+bgcolor(enable_24h_trading ? color.new(color.green, 98) : in_session ? color.new(color.green, 95) : na, title="Trading Session")
+
+// Opening range lines, one pair per day.
+var line range_high_line = na
+var line range_low_line  = na
+if is_new_day
+    range_high_line := na
+    range_low_line  := na
+
+if show_range and range_established
+    if na(range_high_line)
+        range_high_line := line.new(bar_index, range_high, bar_index + 10, range_high, color=color.red, style=line.style_dashed, width=2)
+        range_low_line  := line.new(bar_index, range_low, bar_index + 10, range_low, color=color.green, style=line.style_dashed, width=2)
+    else
+        line.set_x2(range_high_line, bar_index + 10)
+        line.set_x2(range_low_line, bar_index + 10)
+
+// =============================================================================
+// Labels
+// =============================================================================
+
+blocked_label(bool is_long, string reason, color bg) =>
+    if is_long
+        label.new(bar_index, low - atr * 0.8, "LONG BLOCKED\n" + reason, color=bg, style=label.style_label_up, textcolor=color.white, size=size.small)
+    else
+        label.new(bar_index, high + atr * 0.8, "SHORT BLOCKED\n" + reason, color=bg, style=label.style_label_down, textcolor=color.white, size=size.small)
+
+entry_label_text(string side, string reason, bool has_divergence) =>
+    txt = side + "\n" + reason + (force_trend ? " [TREND FILTER]" : "")
+    txt += "\nStrength: " + str.tostring(signal_strength, "#") + "%"
+    if show_regime_info and enable_adaptive_mode
+        txt += "\nRegime: " + regime_type + " (" + str.tostring(regime_confidence, "#") + "%)"
+    if enable_24h_trading
+        txt += "\nSession: " + session_info
+    if has_divergence
+        txt += "\nRSI divergence"
+    if is_open_hour
+        txt += "\nOpen hour OK"
+    txt
+
+if show_signals
+    if signal_blocked_by_range_100_only
+        reason = "100% range confidence"
+        if raw_long_signal
+            blocked_label(true, reason, color.red)
+        if raw_short_signal
+            blocked_label(false, reason, color.red)
+
+    if signal_blocked_by_open_hour_only
+        reason = "Open hour: strength " + str.tostring(signal_strength, "#") + "% < " + str.tostring(min_strength_open_hour) + "%"
+        if raw_long_signal
+            blocked_label(true, reason, color.blue)
+        if raw_short_signal
+            blocked_label(false, reason, color.blue)
+
+    if signal_blocked_by_no_trade_only
+        reason = "No-trade window " + no_trade_window_text
+        if raw_long_signal
+            blocked_label(true, reason, color.orange)
+        if raw_short_signal
+            blocked_label(false, reason, color.orange)
+
+    if signal_blocked_by_bar_confirmation and not win_override
+        reason = "Need " + str.tostring(clean_candles_required) + " clean candles"
+        if raw_long_signal and not long_is_clean
+            blocked_label(true, reason, color.orange)
+        if raw_short_signal and not short_is_clean
+            blocked_label(false, reason, color.orange)
+
+    if win_override and any_signal_present
+        override_text = "WIN OVERRIDE\nLast: $" + str.tostring(last_trade_pnl, "#.##")
+        if raw_long_signal and not long_is_clean
+            label.new(bar_index, low - atr * 1.2, override_text, color=color.lime, style=label.style_label_up, textcolor=color.black, size=size.small)
+        if raw_short_signal and not short_is_clean
+            label.new(bar_index, high + atr * 1.2, override_text, color=color.lime, style=label.style_label_down, textcolor=color.black, size=size.small)
+
+    if long_entry_confirmed
+        reason = bull_breakout ? "Breakout" : bull_momentum ? "Momentum" : "Gap Fill"
+        label.new(bar_index, low - atr * 0.5, entry_label_text("BUY", reason, rsi_div_bull), color=color.green, style=label.style_label_up, textcolor=color.white, size=size.normal)
+
+    if short_entry_confirmed
+        reason = bear_breakout ? "Breakout" : bear_momentum ? "Momentum" : "Gap Fill"
+        label.new(bar_index, high + atr * 0.5, entry_label_text("SELL", reason, rsi_div_bear), color=color.red, style=label.style_label_down, textcolor=color.white, size=size.normal)
+
+    if is_choppy_market and any_signal_present
+        label.new(bar_index, high + atr * 0.8, "CHOPPY - NO SIGNAL\nScore: " + str.tostring(total_chop_score), color=color.yellow, style=label.style_label_down, textcolor=color.black, size=size.small)
+
+    if exited
+        if long_stop_hit
+            label.new(bar_index, high + atr * 0.3, "STOP\nLOSS", color=color.red, style=label.style_label_down, textcolor=color.white, size=size.small)
+        if long_target_hit
+            label.new(bar_index, high + atr * 0.3, "TAKE\nPROFIT", color=color.green, style=label.style_label_down, textcolor=color.white, size=size.small)
+        if short_stop_hit
+            label.new(bar_index, low - atr * 0.3, "STOP\nLOSS", color=color.red, style=label.style_label_up, textcolor=color.white, size=size.small)
+        if short_target_hit
+            label.new(bar_index, low - atr * 0.3, "TAKE\nPROFIT", color=color.green, style=label.style_label_up, textcolor=color.white, size=size.small)
+
+    if alert_6am_condition
+        txt = "MORNING CHECK\nMarket ready"
+        if show_regime_info and enable_adaptive_mode
+            txt += "\nTrend: " + str.tostring(trend_confidence, "#") + "% (need " + str.tostring(trend_confidence_threshold) + "%)"
+            txt += "\nRange: " + str.tostring(range_confidence, "#") + "% (need " + str.tostring(range_confidence_threshold) + "%)"
+        if enable_no_trade_window
+            txt += "\nNo-trade: " + (in_no_trade_period ? "ACTIVE" : "CLEAR")
+        if enable_open_hour_protection
+            txt += "\nOpen hour: " + (is_open_hour ? "PROTECTED" : "CLEAR")
+        txt += "\nChop score: " + str.tostring(total_chop_score)
+        if block_100_percent_range
+            txt += "\nRange block: " + (is_100_percent_range ? "ACTIVE" : "CLEAR")
+        label.new(bar_index, high + atr * 1.2, txt, color=color.lime, style=label.style_label_down, textcolor=color.black, size=size.large, tooltip="Market conditions favorable at " + alert_time + " ET")
+
+// =============================================================================
+// Tables
+// =============================================================================
+
+status_row(table t, int r, string name, string value, color bg, color fg = color.white) =>
+    table.cell(t, 0, r, name, text_color=color.black)
+    table.cell(t, 1, r, value, text_color=fg, bgcolor=bg)
+    r + 1
+
+score_row(table t, int r, string name, string trend_val, string range_val) =>
+    table.cell(t, 0, r, name, text_color=color.black, text_size=size.tiny)
+    table.cell(t, 1, r, trend_val, text_color=color.black, text_size=size.tiny)
+    table.cell(t, 2, r, range_val, text_color=color.black, text_size=size.tiny)
+
+market_row(table t, int r, string value, color bg) =>
+    table.cell(t, 0, r, value, text_color=color.white, text_size=size.small, bgcolor=bg)
+    r + 1
+
+confirm_status(int streak, bool is_clean) =>
+    status = is_clean ? "READY" : win_override ? "WIN OVERRIDE" : "WAITING"
+    col    = is_clean ? color.green : win_override ? color.lime : color.orange
+    [str.tostring(streak) + "/" + str.tostring(clean_candles_required) + " (" + status + ")", col]
+
+clear_text(bool active, string active_text) => active ? active_text : "CLEAR"
+yes_no(bool b) => b ? "YES" : "NO"
+pass_color(bool ok) => ok ? color.green : color.red
+confidence_text(float conf, int threshold) => str.tostring(conf, "#") + "% (need " + str.tostring(threshold) + "%)"
+
+if barstate.islast
+    regime_color = is_trend_regime ? color.blue : is_range_regime ? color.orange : color.gray
+    chop_color   = total_chop_score >= 80 ? color.red : total_chop_score >= 40 ? color.orange : color.green
+
+    // --- Status (top right) ---
+    var table status_table = table.new(position.top_right, 2, 30, bgcolor=color.white, border_width=1)
+    table.clear(status_table, 0, 0, 1, 29)
+
+    table.cell(status_table, 0, 0, "Status", text_color=color.black, bgcolor=color.gray)
+    table.cell(status_table, 1, 0, in_position ? position_type : "FLAT", text_color=color.white, bgcolor=not in_position ? color.gray : position_type == "LONG" ? color.green : color.red)
+    r = 1
+    r := status_row(status_table, r, "Adaptive Mode", enable_adaptive_mode ? "ON" : "OFF", enable_adaptive_mode ? color.blue : color.gray)
+
+    if enable_adaptive_mode
+        r := status_row(status_table, r, "Regime", regime_type + " " + regime_subtype, regime_color)
+        r := status_row(status_table, r, "Trend Confidence", confidence_text(trend_confidence, trend_confidence_threshold), pass_color(trend_confidence >= trend_confidence_threshold))
+        r := status_row(status_table, r, "Range Confidence", confidence_text(range_confidence, range_confidence_threshold), pass_color(range_confidence >= range_confidence_threshold))
+        r := status_row(status_table, r, "100% Range Block", clear_text(is_100_percent_range, "ACTIVE"), pass_color(not is_100_percent_range))
+
+    trend_status = not force_trend ? "OFF" : bullish_trend ? "BULL" : bearish_trend ? "BEAR" : "NEUTRAL"
+    trend_color  = not force_trend ? color.gray : bullish_trend ? color.green : bearish_trend ? color.red : color.gray
+
+    market_condition = is_choppy_market ? "CHOPPY" : in_no_trade_period ? "NO-TRADE" : is_open_hour ? "PROTECTED" : is_100_percent_range ? "RANGE BLOCK" : "GOOD"
+    market_color     = is_choppy_market ? color.red : in_no_trade_period ? color.orange : is_open_hour ? color.blue : is_100_percent_range ? color.red : color.green
+
+    [long_confirm_text, long_confirm_color]   = confirm_status(long_clean_streak, long_is_clean)
+    [short_confirm_text, short_confirm_color] = confirm_status(short_clean_streak, short_is_clean)
+
+    last_trade_text  = na(last_trade_type) ? "NONE" : last_trade_type + (last_trade_was_win ? " WIN" : " LOSS")
+    last_trade_color = na(last_trade_type) ? color.gray : pass_color(last_trade_was_win)
+    position_closed  = last_position_closed or manual_position_closed
+
+    alert_text  = not enable_6am_alert ? "OFF" : alert_sent_today ? "SENT" : "ARMED"
+    alert_color = not enable_6am_alert ? color.gray : alert_sent_today ? color.green : color.orange
+
+    r := status_row(status_table, r, "Trading Mode", enable_24h_trading ? "24/7" : "SESSION", enable_24h_trading ? color.blue : color.gray)
+    r := status_row(status_table, r, "Session", enable_24h_trading ? session_info : in_session ? "OPEN" : "CLOSED", pass_color(in_session))
+    r := status_row(status_table, r, "Open Hour Protection", clear_text(is_open_hour, "ACTIVE (9-10AM)"), is_open_hour ? color.blue : color.green)
+    r := status_row(status_table, r, "No-Trade Window", clear_text(in_no_trade_period, "ACTIVE (" + no_trade_window_text + ")"), in_no_trade_period ? color.orange : color.green)
+    r := status_row(status_table, r, "Range", range_established ? "SET" : "FORMING", range_established ? color.green : color.yellow)
+    r := status_row(status_table, r, "Trend Filter", trend_status, trend_color)
+    r := status_row(status_table, r, "Market Condition", market_condition, market_color)
+    r := status_row(status_table, r, "Choppiness Score", str.tostring(total_chop_score), chop_color)
+    r := status_row(status_table, r, "Bar Confirm (Long)", long_confirm_text, long_confirm_color)
+    r := status_row(status_table, r, "Bar Confirm (Short)", short_confirm_text, short_confirm_color)
+    r := status_row(status_table, r, "Last Trade", last_trade_text, last_trade_color)
+    r := status_row(status_table, r, "Position Closed", yes_no(position_closed), pass_color(position_closed))
+    r := status_row(status_table, r, "Morning Alert", alert_text, alert_color)
+    r := status_row(status_table, r, "Can Long", yes_no(can_enter_long), pass_color(can_enter_long))
+    r := status_row(status_table, r, "Can Short", yes_no(can_enter_short), pass_color(can_enter_short))
+
+    if in_position and not na(entry_price)
+        current_pnl    = position_type == "LONG" ? close - entry_price : entry_price - close
+        strength_color = entry_strength >= 80 ? color.green : entry_strength >= 60 ? color.orange : color.red
+        r := status_row(status_table, r, "Entry", str.tostring(entry_price, "#.##"), na, color.black)
+        r := status_row(status_table, r, "Stop Loss", str.tostring(stop_loss, "#.##"), color.red)
+        r := status_row(status_table, r, "Take Profit", str.tostring(take_profit, "#.##"), color.green)
+        r := status_row(status_table, r, "Signal Strength", str.tostring(entry_strength, "#") + "%", strength_color)
+        r := status_row(status_table, r, "Current P&L", "$" + str.tostring(current_pnl, "#.##"), pass_color(current_pnl >= 0))
+
+    // --- Regime scoring (bottom right) ---
+    if enable_adaptive_mode
+        var table regime_table = table.new(position.bottom_right, 3, 12, bgcolor=color.white, border_width=1)
+
+        table.cell(regime_table, 0, 0, "REGIME SCORING", text_color=color.white, bgcolor=color.navy, text_size=size.small)
+        table.cell(regime_table, 1, 0, "TREND", text_color=color.white, bgcolor=color.blue, text_size=size.small)
+        table.cell(regime_table, 2, 0, "RANGE", text_color=color.white, bgcolor=color.orange, text_size=size.small)
+
+        score_row(regime_table, 1, "Volatility", str.tostring(vol_trend_pts), str.tostring(vol_range_pts))
+        score_row(regime_table, 2, "Trend Strength", str.tostring(strength_trend_pts), str.tostring(strength_range_pts))
+        score_row(regime_table, 3, "Price Structure", str.tostring(struct_trend_pts), str.tostring(struct_range_pts))
+        score_row(regime_table, 4, "Session", str.tostring(session_trend_pts), str.tostring(session_range_pts))
+        score_row(regime_table, 5, "Near VWAP", "0", str.tostring(vwap_range_pts))
+        score_row(regime_table, 6, "Volume", str.tostring(volume_trend_pts), str.tostring(volume_range_pts))
+
+        table.cell(regime_table, 0, 7, "RAW TOTAL", text_color=color.white, bgcolor=color.gray, text_size=size.small)
+        table.cell(regime_table, 1, 7, str.tostring(trend_score), text_color=color.black, text_size=size.small)
+        table.cell(regime_table, 2, 7, str.tostring(range_score), text_color=color.black, text_size=size.small)
+
+        table.cell(regime_table, 0, 8, "CONFIDENCE", text_color=color.white, bgcolor=color.gray, text_size=size.small)
+        table.cell(regime_table, 1, 8, str.tostring(trend_confidence, "#") + "%", text_color=color.white, bgcolor=pass_color(is_trend_regime), text_size=size.small)
+        table.cell(regime_table, 2, 8, str.tostring(range_confidence, "#") + "%", text_color=color.white, bgcolor=pass_color(is_range_regime), text_size=size.small)
+
+        score_row(regime_table, 9, "THRESHOLD", str.tostring(trend_confidence_threshold) + "%", str.tostring(range_confidence_threshold) + "%")
+        score_row(regime_table, 10, "ADX", str.tostring(adx, "#.#"), str.tostring(adx, "#.#"))
+        score_row(regime_table, 11, "VWAP Dist", str.tostring(vwap_distance, "#.##") + "%", str.tostring(vwap_distance, "#.##") + "%")
+
+    // --- Market state (bottom left) ---
+    var table market_table = table.new(position.bottom_left, 1, 10, bgcolor=color.white, border_width=2)
+    table.clear(market_table, 0, 0, 0, 9)
+
+    table.cell(market_table, 0, 0, "MARKET STATE", text_color=color.black, text_size=size.small, bgcolor=color.gray)
+    table.cell(market_table, 0, 1, choppiness_level, text_color=color.white, text_size=size.normal, bgcolor=chop_color)
+    table.cell(market_table, 0, 2, "Score: " + str.tostring(total_chop_score), text_color=color.black, text_size=size.tiny)
+    m = 3
+
+    if enable_adaptive_mode
+        m := market_row(market_table, m, regime_type + " MODE", regime_color)
+        conf_text = is_trend_regime ? str.tostring(trend_confidence, "#") + "%" : is_range_regime ? str.tostring(range_confidence, "#") + "%" : "N/A"
+        table.cell(market_table, 0, m, "Conf: " + conf_text, text_color=color.black, text_size=size.tiny)
+        m += 1
+        if block_100_percent_range
+            m := market_row(market_table, m, clear_text(is_100_percent_range, "100% BLOCK"), pass_color(not is_100_percent_range))
+
+    if enable_open_hour_protection
+        m := market_row(market_table, m, clear_text(is_open_hour, "OPEN HOUR"), is_open_hour ? color.blue : color.green)
+    if enable_no_trade_window
+        m := market_row(market_table, m, clear_text(in_no_trade_period, "NO-TRADE"), in_no_trade_period ? color.orange : color.green)
+    m := market_row(market_table, m, session_info, session_favors_trend ? color.blue : session_favors_range ? color.orange : color.gray)
+
+// =============================================================================
+// Alerts
+// =============================================================================
+
+// Webhook payloads. alertcondition() needs compile-time constant strings, so these
+// are built from literals only.
+WEBHOOK_TOKEN   = "NE695dae7d94112c52b1e5"
+WEBHOOK_ACCOUNT = "TAKEPROFIT8652217"
+WEBHOOK_HEAD    = '{"symbol": "GC1!", "date": "{{timenow}}", "data": "'
+WEBHOOK_TAIL    = '", "quantity": 2, "risk_percentage": 0, "price": "{{close}}", "gtd_in_second": 0, "stp_limit_stp_price": 0, "tp": 0, "percentage_tp": 0, "dollar_tp": 5, "sl": 0, "percentage_sl": 0, "dollar_sl": 10, "trail": 0, "trail_stop": 0, "trail_trigger": 0, "trail_freq": 0, "update_tp": false, "update_sl": false, "breakeven": 0, "token": "' + WEBHOOK_TOKEN + '", "pyramid": false, "reverse_order_close": true, "order_type": "MKT", "multiple_accounts": [{"token": "' + WEBHOOK_TOKEN + '", "account_id": "' + WEBHOOK_ACCOUNT + '", "quantity_multiplier": 1}]}'
+
+alertcondition(long_entry_confirmed, title="Gold BUY", message=WEBHOOK_HEAD + "buy" + WEBHOOK_TAIL)
+alertcondition(short_entry_confirmed, title="Gold SELL", message=WEBHOOK_HEAD + "sell" + WEBHOOK_TAIL)
+
+alertcondition(long_stop_hit or short_stop_hit, title="Gold Stop Loss Hit", message="Gold: stop loss hit")
+alertcondition(long_target_hit or short_target_hit, title="Gold Take Profit Hit", message="Gold: take profit hit")
+
+alertcondition(alert_6am_condition, title="Gold Morning Market Check", message="Gold: conditions look tradeable. Check regime and range block status.")
+
+// Regime
+alertcondition(enable_adaptive_mode and regime_type != regime_type[1], title="Gold Regime Change", message="Gold: regime changed")
+alertcondition(enable_adaptive_mode and regime_type == "TREND" and regime_type[1] == "RANGE", title="Gold Switch to Trend", message="Gold: switched to trend regime")
+alertcondition(enable_adaptive_mode and regime_type == "RANGE" and regime_type[1] == "TREND", title="Gold Switch to Range", message="Gold: switched to range regime")
+alertcondition(enable_adaptive_mode and trend_confidence >= trend_confidence_threshold and trend_confidence[1] < trend_confidence_threshold, title="Gold Trend Threshold Crossed", message="Gold: trend confidence crossed threshold")
+alertcondition(enable_adaptive_mode and range_confidence >= range_confidence_threshold and range_confidence[1] < range_confidence_threshold, title="Gold Range Threshold Crossed", message="Gold: range confidence crossed threshold")
+
+alertcondition(block_100_percent_range and is_100_percent_range and not is_100_percent_range[1], title="Gold Range Block On", message="Gold: 100% range confidence, trades blocked")
+alertcondition(block_100_percent_range and not is_100_percent_range and is_100_percent_range[1], title="Gold Range Block Off", message="Gold: range block cleared, trading can resume")
+
+alertcondition(high_vol_regime and not high_vol_regime[1], title="Gold High Volatility", message="Gold: high volatility regime")
+alertcondition(low_vol_regime and not low_vol_regime[1], title="Gold Low Volatility", message="Gold: low volatility regime")
+
+// Time windows
+alertcondition(in_no_trade_period and not in_no_trade_period[1], title="Gold No-Trade Window Start", message="Gold: no-trade window started")
+alertcondition(not in_no_trade_period and in_no_trade_period[1], title="Gold No-Trade Window End", message="Gold: no-trade window ended")
+alertcondition(is_open_hour and not is_open_hour[1], title="Gold Open Hour Protection Start", message="Gold: open hour protection on (9-10 AM ET)")
+alertcondition(not is_open_hour and is_open_hour[1], title="Gold Open Hour Protection End", message="Gold: open hour protection off")
+
+// Overrides & blocks
+alertcondition(win_override and raw_long_signal and not long_is_clean, title="Gold Win Override LONG", message="Gold: long signal via win override")
+alertcondition(win_override and raw_short_signal and not short_is_clean, title="Gold Win Override SHORT", message="Gold: short signal via win override")
+alertcondition(signal_blocked_by_bar_confirmation, title="Gold Blocked - Bar Confirmation", message="Gold: signal blocked, waiting for clean candles")
+alertcondition(signal_blocked_by_no_trade_only, title="Gold Blocked - No-Trade Window", message="Gold: signal blocked by no-trade window")
+alertcondition(signal_blocked_by_open_hour_only, title="Gold Blocked - Open Hour", message="Gold: signal blocked by open hour protection (strength too low)")
+alertcondition(signal_blocked_by_range_100_only, title="Gold Blocked - 100% Range", message="Gold: signal blocked by 100% range confidence")
